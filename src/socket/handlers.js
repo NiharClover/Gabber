@@ -12,13 +12,12 @@ function findSocketByUserId(io, userId) {
 
 function registerHandlers(io, socket) {
 
-  
   console.log(`[socket] connected: ${socket.username} (${socket.userId})`);
 
   // Notify others this user is online
   socket.broadcast.emit("user:online", { userId: socket.userId });
 
-  // ─── 1:1 message send ──────────────────────────────────
+  // ─── 1:1 message send ──────────────────────────────────────────────────────
   socket.on("message:send", async ({ to, text, replyTo }) => {
     try {
       if (!to || !text) return;
@@ -82,7 +81,7 @@ function registerHandlers(io, socket) {
         reply_to_sender: replyTo?.sender || null,
       };
 
-      // Confirm to sender (single emit, single time)
+      // Confirm to sender
       socket.emit("message:sent", payload);
 
       // Deliver to recipient if online
@@ -110,7 +109,7 @@ function registerHandlers(io, socket) {
     }
   });
 
-  // ─── Group message send ────────────────────────────────
+  // ─── Group message send ────────────────────────────────────────────────────
   socket.on("group:message:send", async ({ chatId, text, replyTo }) => {
     try {
       if (!chatId || !text) return;
@@ -164,7 +163,7 @@ function registerHandlers(io, socket) {
     }
   });
 
-  // ─── Sticker send ───────────────────────────────────────
+  // ─── Sticker send ──────────────────────────────────────────────────────────
   socket.on("sticker:send", async ({ to, chatId, svg, isGroup }) => {
     try {
       const messageId = randomUUID();
@@ -203,10 +202,15 @@ function registerHandlers(io, socket) {
       socket.emit("message:sent", payload);
 
       if (isGroup) {
-        const members = await pool.query("SELECT user_id FROM chat_members WHERE chat_id = $1 AND user_id != $2", [targetChatId, socket.userId]);
+        const members = await pool.query(
+          "SELECT user_id FROM chat_members WHERE chat_id = $1 AND user_id != $2",
+          [targetChatId, socket.userId]
+        );
         for (const member of members.rows) {
           const memberSocket = findSocketByUserId(io, member.user_id);
-          if (memberSocket && memberSocket.id !== socket.id) memberSocket.emit("message:receive", payload);
+          if (memberSocket && memberSocket.id !== socket.id) {
+            memberSocket.emit("message:receive", payload);
+          }
         }
       } else {
         const recipientSocket = findSocketByUserId(io, to);
@@ -219,62 +223,97 @@ function registerHandlers(io, socket) {
     }
   });
 
-  // ─── Message delete ─────────────────────────────────────
- socket.on("message:delete", async ({ messageId, chatId, forEveryone }) => {
-  console.log(`[delete] received: messageId=${messageId}, chatId=${chatId}, forEveryone=${forEveryone}, from=${socket.username}`);
-  try {
-    if (forEveryone) {
-      const check = await pool.query("SELECT sender_id FROM messages WHERE id = $1", [messageId]);
-      console.log(`[delete] sender_id in DB = ${check.rows[0]?.sender_id}, socket.userId = ${socket.userId}`);
+  // ─── Message delete ────────────────────────────────────────────────────────
+  socket.on("message:delete", async ({ messageId, chatId, forEveryone }) => {
+    console.log(`[delete] received: messageId=${messageId}, chatId=${chatId}, forEveryone=${forEveryone}, from=${socket.username}`);
+    try {
+      if (forEveryone) {
+        const check = await pool.query(
+          "SELECT sender_id FROM messages WHERE id = $1",
+          [messageId]
+        );
+        console.log(`[delete] sender_id in DB = ${check.rows[0]?.sender_id}, socket.userId = ${socket.userId}`);
 
-      if (check.rows[0]?.sender_id !== socket.userId) {
-        console.log(`[delete] BLOCKED - sender mismatch`);
-        return;
+        if (check.rows[0]?.sender_id !== socket.userId) {
+          console.log(`[delete] BLOCKED - sender mismatch`);
+          return;
+        }
+
+        const updateResult = await pool.query(
+          "UPDATE messages SET deleted_for_everyone = true WHERE id = $1 RETURNING id, deleted_for_everyone",
+          [messageId]
+        );
+        console.log(`[delete] update result:`, updateResult.rows);
+
+        const members = await pool.query(
+          "SELECT user_id FROM chat_members WHERE chat_id = $1",
+          [chatId]
+        );
+        console.log(`[delete] notifying members:`, members.rows);
+
+        for (const m of members.rows) {
+          const memberSocket = findSocketByUserId(io, m.user_id);
+          if (memberSocket) {
+            memberSocket.emit("message:deleted", { messageId, chatId, forEveryone: true });
+          }
+        }
+      } else {
+        const result = await pool.query(
+          "UPDATE messages SET deleted_for_sender = true WHERE id = $1 AND sender_id = $2 RETURNING id",
+          [messageId, socket.userId]
+        );
+        console.log(`[delete] for-me update result:`, result.rows);
+        socket.emit("message:deleted", { messageId, chatId, forEveryone: false });
       }
-
-      const updateResult = await pool.query("UPDATE messages SET deleted_for_everyone = true WHERE id = $1 RETURNING id, deleted_for_everyone", [messageId]);
-      console.log(`[delete] update result:`, updateResult.rows);
-
-      const members = await pool.query("SELECT user_id FROM chat_members WHERE chat_id = $1", [chatId]);
-      console.log(`[delete] notifying members:`, members.rows);
-
-      for (const m of members.rows) {
-        const memberSocket = findSocketByUserId(io, m.user_id);
-        if (memberSocket) memberSocket.emit("message:deleted", { messageId, chatId, forEveryone: true });
-      }
-    } else {
-      const result = await pool.query("UPDATE messages SET deleted_for_sender = true WHERE id = $1 AND sender_id = $2 RETURNING id", [messageId, socket.userId]);
-      console.log(`[delete] for-me update result:`, result.rows);
-      socket.emit("message:deleted", { messageId, chatId, forEveryone: false });
+    } catch (err) {
+      console.error("[delete] Error:", err.message);
     }
-  } catch (err) {
-    console.error("[delete] Error:", err.message);
-  }
-});
+  });
 
-  // ─── Messages read ──────────────────────────────────────
+  // ─── Messages read ─────────────────────────────────────────────────────────
+  // Called when a user opens a chat — marks messages from `fromUserId` as read,
+  // sends blue ticks back to the sender, and updates both users' chat list badges.
   socket.on("messages:read", async ({ chatId, fromUserId }) => {
     try {
+      if (!chatId || !fromUserId) return;
+
+      // Mark all unread messages sent by fromUserId in this chat as read
       const result = await pool.query(
-        `UPDATE messages SET status = 'read'
-         WHERE chat_id = $1 AND sender_id = $2 AND status != 'read'
+        `UPDATE messages
+         SET status = 'read'
+         WHERE chat_id = $1
+           AND sender_id = $2
+           AND status != 'read'
          RETURNING id`,
         [chatId, fromUserId]
       );
 
+      // Nothing changed — skip all emits
+      if (result.rows.length === 0) return;
+
+      // 1. Tell the SENDER their messages were read (blue ticks on each message)
       const senderSocket = findSocketByUserId(io, fromUserId);
       if (senderSocket) {
         for (const row of result.rows) {
           senderSocket.emit("message:status", { id: row.id, status: "read" });
         }
+        // Let sender's chat list know this conversation was read
         senderSocket.emit("messages:read", { chatId, readBy: socket.userId });
       }
+
+      // 2. Tell the READER's own socket to zero the unread badge in the chat list
+      //    (hits the chat:updated listener in chats.js frontend)
+      socket.emit("chat:updated", { chatId, unread_count: 0 });
+
+      console.log(
+        `[read] ${socket.username} read ${result.rows.length} msg(s) in chat ${chatId} (from ${fromUserId})`
+      );
     } catch (err) {
       console.error("[read] Error:", err.message);
     }
   });
 
-  // ─── Typing indicators ──────────────────────────────────
+  // ─── Typing indicators ─────────────────────────────────────────────────────
   socket.on("typing:start", ({ to }) => {
     const targetSocket = findSocketByUserId(io, to);
     if (targetSocket) targetSocket.emit("typing:start", { from: socket.userId });
@@ -285,7 +324,7 @@ function registerHandlers(io, socket) {
     if (targetSocket) targetSocket.emit("typing:stop", { from: socket.userId });
   });
 
-  // ─── Disconnect ─────────────────────────────────────────
+  // ─── Disconnect ────────────────────────────────────────────────────────────
   socket.on("disconnect", () => {
     console.log(`[disconnect] ${socket.username} went offline`);
     socket.broadcast.emit("user:offline", { userId: socket.userId });
