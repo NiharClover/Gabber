@@ -115,18 +115,45 @@ async function getGroupMembers(chatId) {
 
 async function getUserChats(userId) {
   const result = await pool.query(
-    `SELECT
-       c.id, c.type, c.name, c.last_message_at,
-       -- For direct chats: other user's info
-       u.id AS other_user_id,
-       u.username AS other_username,
-       u.avatar_url,
-       (SELECT text FROM messages WHERE chat_id = c.id ORDER BY created_at DESC LIMIT 1) AS last_message
-     FROM chats c
-     JOIN chat_members cm ON cm.chat_id = c.id AND cm.user_id = $1
-     LEFT JOIN chat_members cm2 ON cm2.chat_id = c.id AND cm2.user_id != $1 AND c.type = 'direct'
-     LEFT JOIN users u ON u.id = cm2.user_id
-     ORDER BY c.last_message_at DESC`,
+    `SELECT 
+      c.id,
+      c.type,
+      c.name,
+      c.avatar_url,
+      CASE 
+        WHEN c.type = 'direct' THEN u.username
+        ELSE c.name
+      END AS display_name,
+      CASE 
+        WHEN c.type = 'direct' THEN u.id
+        ELSE NULL
+      END AS other_user_id,
+      CASE
+        WHEN c.type = 'direct' THEN u.avatar_url
+        ELSE c.avatar_url
+      END AS other_avatar_url,
+      m.text AS last_message,
+      m.created_at AS last_message_time,
+      m.sender_id AS last_message_sender,
+      (
+        SELECT COUNT(*) FROM messages 
+        WHERE chat_id = c.id 
+        AND sender_id != $1 
+        AND status != 'read'
+        AND deleted_for_everyone = false
+      ) AS unread_count
+    FROM chats c
+    JOIN chat_members cm ON cm.chat_id = c.id AND cm.user_id = $1
+    LEFT JOIN chat_members cm2 ON cm2.chat_id = c.id AND cm2.user_id != $1 AND c.type = 'direct'
+    LEFT JOIN users u ON u.id = cm2.user_id
+    LEFT JOIN LATERAL (
+      SELECT text, created_at, sender_id FROM messages 
+      WHERE chat_id = c.id 
+      AND deleted_for_everyone = false
+      ORDER BY created_at DESC LIMIT 1
+    ) m ON true
+    GROUP BY c.id, c.type, c.name, c.avatar_url, u.username, u.id, u.avatar_url, m.text, m.created_at, m.sender_id
+    ORDER BY m.created_at DESC NULLS LAST`,
     [userId]
   );
   return result.rows;
