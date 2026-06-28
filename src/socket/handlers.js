@@ -313,6 +313,42 @@ function registerHandlers(io, socket) {
     }
   });
 
+
+  // ─── WebRTC Signaling ──────────────────────────────────────
+  socket.on("call:offer", ({ to, offer, callType }) => {
+    const recipientSocket = findSocketByUserId(io, to);
+    if (recipientSocket) {
+      recipientSocket.emit("call:incoming", {
+        from: socket.userId,
+        fromName: socket.username,
+        offer,
+        callType,
+      });
+    } else {
+      socket.emit("call:unavailable", { userId: to });
+    }
+  });
+
+  socket.on("call:answer", ({ to, answer }) => {
+    const recipientSocket = findSocketByUserId(io, to);
+    if (recipientSocket) recipientSocket.emit("call:answered", { answer });
+  });
+
+  socket.on("call:ice", ({ to, candidate }) => {
+    const recipientSocket = findSocketByUserId(io, to);
+    if (recipientSocket) recipientSocket.emit("call:ice", { candidate });
+  });
+
+  socket.on("call:end", ({ to }) => {
+    const recipientSocket = findSocketByUserId(io, to);
+    if (recipientSocket) recipientSocket.emit("call:ended", { from: socket.userId });
+  });
+
+  socket.on("call:reject", ({ to }) => {
+    const recipientSocket = findSocketByUserId(io, to);
+    if (recipientSocket) recipientSocket.emit("call:rejected", { from: socket.userId });
+  });
+
   // ─── Typing indicators ─────────────────────────────────────────────────────
   socket.on("typing:start", ({ to }) => {
     const targetSocket = findSocketByUserId(io, to);

@@ -123,7 +123,7 @@ async function getUserChats(userId) {
       CASE 
         WHEN c.type = 'direct' THEN u.username
         ELSE c.name
-      END AS display_name,
+      END AS other_username,
       CASE 
         WHEN c.type = 'direct' THEN u.id
         ELSE NULL
@@ -133,7 +133,7 @@ async function getUserChats(userId) {
         ELSE c.avatar_url
       END AS other_avatar_url,
       m.text AS last_message,
-      m.created_at AS last_message_time,
+      m.created_at AS last_message_at,
       m.sender_id AS last_message_sender,
       (
         SELECT COUNT(*) FROM messages 
@@ -144,13 +144,17 @@ async function getUserChats(userId) {
       ) AS unread_count
     FROM chats c
     JOIN chat_members cm ON cm.chat_id = c.id AND cm.user_id = $1
-    LEFT JOIN chat_members cm2 ON cm2.chat_id = c.id AND cm2.user_id != $1 AND c.type = 'direct'
+    LEFT JOIN chat_members cm2 ON cm2.chat_id = c.id 
+      AND cm2.user_id != $1 
+      AND c.type = 'direct'
     LEFT JOIN users u ON u.id = cm2.user_id
     LEFT JOIN LATERAL (
-      SELECT text, created_at, sender_id FROM messages 
+      SELECT text, created_at, sender_id 
+      FROM messages 
       WHERE chat_id = c.id 
       AND deleted_for_everyone = false
-      ORDER BY created_at DESC LIMIT 1
+      ORDER BY created_at DESC 
+      LIMIT 1
     ) m ON true
     GROUP BY c.id, c.type, c.name, c.avatar_url, u.username, u.id, u.avatar_url, m.text, m.created_at, m.sender_id
     ORDER BY m.created_at DESC NULLS LAST`,

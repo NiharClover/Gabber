@@ -33,62 +33,55 @@ router.post("/send-otp", otpRateLimit, async (req, res) => {
 
 // POST /api/auth/verify-otp
 router.post("/verify-otp", async (req, res) => {
-  console.log("[verify-otp] hit with:", req.body);
-  const { phone, otp, username } = req.body;
-
-  if (!phone || !otp) {
-    return res.status(400).json({ error: "phone and otp are required." });
-  }
-
-  const result = await verifyOTP(phone, otp);
-  console.log("[verify-otp] OTP result:", result);
-
-  if (!result.valid) {
-    return res.status(401).json({ error: result.reason });
-  }
-
+  const { phone, otp } = req.body;
   try {
-    let userResult = await pool.query(
-      "SELECT * FROM users WHERE phone = $1",
-      [phone]
+    // Verify OTP with MSG91
+    const verified = await verifyOTP(phone, otp);
+    if (!verified) return res.status(400).json({ error: "Invalid OTP." });
+
+    // Check if user exists
+    const existing = await pool.query(
+      "SELECT * FROM users WHERE phone = $1", [phone]
     );
 
-    let user = userResult.rows[0];
-    const isNewUser = !user;
+    let user;
+    let isNewUser = false;
 
-    if (isNewUser) {
-      if (!username) {
-        return res.status(400).json({ error: "username required for new users." });
-      }
-      const userId = `user_${randomUUID().split("-")[0]}`;
-      const insertResult = await pool.query(
-        `INSERT INTO users (id, phone, username) VALUES ($1, $2, $3) RETURNING *`,
-        [userId, phone, username]
-      );
-      user = insertResult.rows[0];
-      console.log(`[auth] New user: ${username} (${phone})`);
+    if (existing.rows[0]) {
+      user = existing.rows[0];
     } else {
-      await pool.query(
-        "UPDATE users SET last_seen = NOW() WHERE id = $1",
-        [user.id]
+      // New user — create with placeholder username
+      isNewUser = true;
+      const userId = `user_${randomUUID().split("-")[0]}`;
+      const result = await pool.query(
+        `INSERT INTO users (id, phone, username, about) 
+         VALUES ($1, $2, $3, $4) RETURNING *`,
+        [userId, phone, `User${phone.slice(-4)}`, "Hey there! I am using Gabber."]
       );
+      user = result.rows[0];
     }
 
     const token = jwt.sign(
-      { userId: user.id, phone: user.phone, username: user.username },
+      { userId: user.id, phone: user.phone },
       process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN }
+      { expiresIn: "30d" }
     );
 
     res.json({
       success: true,
-      isNewUser,
       token,
-      user: { userId: user.id, username: user.username, phone: user.phone },
+      user: {
+        userId: user.id,
+        username: user.username,
+        phone: user.phone,
+        avatarUrl: user.avatar_url,
+        about: user.about,
+        email: user.email,
+      },
+      isNewUser,
     });
-
   } catch (err) {
-    console.error("[auth] DB error:", err.message);
+    console.error("[verify-otp]", err.message);
     res.status(500).json({ error: "Server error." });
   }
 });
