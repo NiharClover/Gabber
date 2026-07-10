@@ -1,46 +1,66 @@
 const { Expo } = require("expo-server-sdk");
-const pool = require("../db/pool");
-
 const expo = new Expo();
 
-async function sendPushNotification(userId, title, body, data = {}) {
+async function sendPushNotification(pushToken, data) {
+  if (!Expo.isExpoPushToken(pushToken)) {
+    console.error("[push] Invalid token:", pushToken);
+    return;
+  }
+
+  const { type, senderName, text, chatId, otherUserId, groupName } = data;
+
+  let title = "";
+  let body = "";
+
+  if (type === "message") {
+    title = senderName;
+    if (text?.startsWith("[image]")) body = "📷 Sent a photo";
+    else if (text?.startsWith("[view-once]")) body = "👁 Sent a view once photo";
+    else if (text?.startsWith("[voice]")) body = "🎤 Sent a voice message";
+    else if (text?.startsWith("[payment]")) body = "💰 Sent a payment";
+    else if (text?.startsWith("[payment-request]")) body = "💰 Requesting a payment";
+    else if (text?.startsWith("[sticker]")) body = "✨ Sent a sticker";
+    else if (text?.startsWith("[bill]")) body = "🧾 Sent an order bill";
+    else body = text || "New message";
+  } else if (type === "group_message") {
+    title = groupName || "Group message";
+    const preview = text?.startsWith("[image]") ? "📷 Photo"
+      : text?.startsWith("[voice]") ? "🎤 Voice message"
+      : text?.startsWith("[sticker]") ? "✨ Sticker"
+      : text;
+    body = `${senderName}: ${preview}`;
+  } else if (type === "call") {
+    title = "📞 Incoming Call";
+    body = `${senderName} is calling you`;
+  } else if (type === "video_call") {
+    title = "📹 Incoming Video Call";
+    body = `${senderName} wants to video call`;
+  }
+
+  const message = {
+    to: pushToken,
+    sound: "default",
+    title,
+    body,
+    data: { chatId, otherUserId, type, senderName },
+    priority: "high",
+    channelId: "messages",
+    badge: 1,
+    ttl: 3600,
+  };
+
   try {
-    const result = await pool.query(
-      "SELECT push_token FROM device_tokens WHERE user_id = $1 AND push_token IS NOT NULL",
-      [userId]
-    );
-
-    const messages = [];
-    for (const row of result.rows) {
-      if (!Expo.isExpoPushToken(row.push_token)) continue;
-      messages.push({
-        to: row.push_token,
-        sound: "default",
-        title,
-        body,
-        data,
-        priority: "high",
-        channelId: "messages",
-      });
-    }
-
-    if (messages.length === 0) return;
-
-    const chunks = expo.chunkPushNotifications(messages);
+    const chunks = expo.chunkPushNotifications([message]);
     for (const chunk of chunks) {
-      const tickets = await expo.sendPushNotificationsAsync(chunk);
-      for (const ticket of tickets) {
-        if (ticket.status === "error") {
-          console.error("[push] Error:", ticket.message);
-          if (ticket.details?.error === "DeviceNotRegistered") {
-            await pool.query("DELETE FROM device_tokens WHERE push_token = $1", [ticket.details.expoPushToken]);
-          }
+      const receipts = await expo.sendPushNotificationsAsync(chunk);
+      for (const receipt of receipts) {
+        if (receipt.status === "error") {
+          console.error("[push] Error:", receipt.message);
         }
       }
     }
-    console.log(`[push] Sent to ${messages.length} device(s) for user ${userId}`);
   } catch (err) {
-    console.error("[push]", err.message);
+    console.error("[push] Send error:", err.message);
   }
 }
 
