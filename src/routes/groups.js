@@ -4,15 +4,12 @@ const pool = require("../db/pool");
 const { randomUUID } = require("crypto");
 const multer = require("multer");
 const path = require("path");
+const { uploadBuffer } = require("../services/storage");
 
 const router = express.Router();
 router.use(requireAuth);
 
-const groupAvatarStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, "uploads/avatars/"),
-  filename: (req, file, cb) => cb(null, `group_${randomUUID()}${path.extname(file.originalname)}`),
-});
-const groupAvatarUpload = multer({ storage: groupAvatarStorage, limits: { fileSize: 5 * 1024 * 1024 } });
+const groupAvatarUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 // POST /api/groups — create group
 router.post("/", async (req, res) => {
@@ -87,7 +84,9 @@ router.post("/:chatId/avatar", groupAvatarUpload.single("avatar"), async (req, r
       [req.params.chatId, req.user.userId]
     );
     if (adminCheck.rows[0]?.role !== "admin") return res.status(403).json({ error: "Admin only." });
-    const url = `${process.env.BASE_URL || "http://localhost:3000"}/uploads/avatars/${req.file.filename}`;
+    // Same localhost-URL bug as profile.js avatars — fixed via uploadBuffer().
+    const filename = `group_${randomUUID()}${path.extname(req.file.originalname)}`;
+    const url = await uploadBuffer(req.file.buffer, "avatars", filename, req.file.mimetype, req);
     await pool.query("UPDATE chats SET avatar_url = $1 WHERE id = $2", [url, req.params.chatId]);
     res.json({ success: true, url });
   } catch (err) {
@@ -123,6 +122,14 @@ router.delete("/:chatId/members/:userId", async (req, res) => {
       [req.params.chatId, req.user.userId]
     );
     if (adminCheck.rows[0]?.role !== "admin") return res.status(403).json({ error: "Admin only." });
+
+    // Removing yourself through this route bypassed the dedicated /leave
+    // flow (no cleanup semantics, and would let a group end up with zero
+    // members if it was 1:1). Admins leave via /leave like anyone else.
+    if (req.params.userId === req.user.userId) {
+      return res.status(400).json({ error: "Use the leave-group action to remove yourself." });
+    }
+
     await pool.query(
       "DELETE FROM chat_members WHERE chat_id = $1 AND user_id = $2",
       [req.params.chatId, req.params.userId]
@@ -143,6 +150,19 @@ router.patch("/:chatId/members/:userId/role", async (req, res) => {
       [req.params.chatId, req.user.userId]
     );
     if (adminCheck.rows[0]?.role !== "admin") return res.status(403).json({ error: "Admin only." });
+
+    // Prevent a group being left with zero admins — e.g. the only admin
+    // demoting themselves with no one else able to manage the group.
+    if (role === "member" && req.params.userId === req.user.userId) {
+      const adminCount = await pool.query(
+        "SELECT COUNT(*) AS cnt FROM chat_members WHERE chat_id = $1 AND role = 'admin'",
+        [req.params.chatId]
+      );
+      if (parseInt(adminCount.rows[0].cnt, 10) <= 1) {
+        return res.status(400).json({ error: "Promote another member to admin first — a group needs at least one admin." });
+      }
+    }
+
     await pool.query(
       "UPDATE chat_members SET role = $1 WHERE chat_id = $2 AND user_id = $3",
       [role, req.params.chatId, req.params.userId]

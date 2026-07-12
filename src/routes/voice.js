@@ -1,26 +1,17 @@
 const express = require("express");
 const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
 const { requireAuth } = require("../middleware/auth");
 const { randomUUID } = require("crypto");
+const { uploadBuffer } = require("../services/storage");
 
 const router = express.Router();
 router.use(requireAuth);
 
-const uploadDir = path.join(__dirname, "../../uploads/voice");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const name = `voice_${Date.now()}_${randomUUID().split("-")[0]}.m4a`;
-    cb(null, name);
-  },
-});
-
+// Switched from disk storage to memory storage so the buffer can go through
+// uploadBuffer() (S3 or local disk depending on config) instead of always
+// writing straight to local disk.
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 16 * 1024 * 1024 }, // 16MB max
   fileFilter: (req, file, cb) => {
     const allowed = ["audio/m4a", "audio/mp4", "audio/mpeg", "audio/wav", "audio/aac", "audio/x-m4a"];
@@ -33,14 +24,20 @@ const upload = multer({
 });
 
 // POST /api/voice/upload
-router.post("/upload", upload.single("audio"), (req, res) => {
+router.post("/upload", upload.single("audio"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No audio file uploaded." });
 
-  const url = `${req.protocol}://${req.get("host")}/uploads/voice/${req.file.filename}`;
-  const duration = req.body.duration ? parseInt(req.body.duration) : 0;
+  try {
+    const filename = `voice_${Date.now()}_${randomUUID().split("-")[0]}.m4a`;
+    const url = await uploadBuffer(req.file.buffer, "voice", filename, req.file.mimetype || "audio/m4a", req);
+    const duration = req.body.duration ? parseInt(req.body.duration) : 0;
 
-  console.log(`[voice] Uploaded: ${req.file.filename} (${duration}s) by ${req.user.username}`);
-  res.json({ success: true, url, filename: req.file.filename, duration });
+    console.log(`[voice] Uploaded: ${filename} (${duration}s) by ${req.user.username}`);
+    res.json({ success: true, url, filename, duration });
+  } catch (err) {
+    console.error("[voice] Error:", err.message);
+    res.status(500).json({ error: "Upload failed." });
+  }
 });
 
 module.exports = router;

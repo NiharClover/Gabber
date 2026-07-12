@@ -35,9 +35,14 @@ router.post("/send-otp", otpRateLimit, async (req, res) => {
 router.post("/verify-otp", async (req, res) => {
   const { phone, otp } = req.body;
   try {
-    // Verify OTP with MSG91
+    // verifyOTP() returns an OBJECT — { valid: true } or { valid: false, reason }
+    // — which is always truthy, even when invalid. Checking `if (!verified)`
+    // here meant this branch could never trigger and ANY otp value would be
+    // accepted. Must check `.valid` explicitly.
     const verified = await verifyOTP(phone, otp);
-    if (!verified) return res.status(400).json({ error: "Invalid OTP." });
+    if (!verified?.valid) {
+      return res.status(400).json({ error: verified?.reason || "Invalid OTP." });
+    }
 
     // Check if user exists
     const existing = await pool.query(

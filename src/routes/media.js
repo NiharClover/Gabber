@@ -1,16 +1,12 @@
 const express = require("express");
 const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
 const sharp = require("sharp");
 const { requireAuth } = require("../middleware/auth");
 const { randomUUID } = require("crypto");
+const { uploadBuffer, deleteFile } = require("../services/storage");
 
 const router = express.Router();
 router.use(requireAuth);
-
-const uploadDir = path.join(__dirname, "../../uploads");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -29,15 +25,16 @@ router.post("/upload", upload.single("file"), async (req, res) => {
   try {
     const viewOnce = req.body.viewOnce === "true";
     const filename = `${Date.now()}_${randomUUID().split("-")[0]}.jpg`;
-    const filepath = path.join(uploadDir, filename);
 
-    const info = await sharp(req.file.buffer)
+    // Compress in memory first, THEN hand the buffer to storage — works
+    // identically whether storage ends up being local disk or S3.
+    const compressed = await sharp(req.file.buffer)
       .resize({ width: 1024, height: 1024, fit: "inside", withoutEnlargement: true })
       .jpeg({ quality: 75, progressive: true })
-      .toFile(filepath);
+      .toBuffer();
 
-    const sizeKB = Math.round(info.size / 1024);
-    const url = `${req.protocol}://${req.get("host")}/uploads/${filename}`;
+    const sizeKB = Math.round(compressed.length / 1024);
+    const url = await uploadBuffer(compressed, "", filename, "image/jpeg", req);
 
     console.log(`[media] Saved: ${filename} (${sizeKB}KB) by ${req.user.username}${viewOnce ? " [view-once]" : ""}`);
 
@@ -55,11 +52,8 @@ router.post("/viewed/:filename", async (req, res) => {
     return res.status(400).json({ error: "Invalid filename." });
   }
   try {
-    const filepath = path.join(uploadDir, filename);
-    if (fs.existsSync(filepath)) {
-      fs.unlinkSync(filepath);
-      console.log(`[media] View-once deleted: ${filename}`);
-    }
+    await deleteFile(filename, "");
+    console.log(`[media] View-once deleted: ${filename}`);
     res.json({ success: true });
   } catch (err) {
     console.error("[media] Delete error:", err.message);

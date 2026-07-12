@@ -28,6 +28,11 @@ const io = new Server(server, {
 });
 const blocksRouter = require("./routes/blocks");
 const safetyRouter = require("./routes/safety");
+const adminRouter = require("./routes/admin");
+
+// Set to "false" in .env to temporarily disable business features
+// (routes + registration) without deleting any code.
+const BUSINESS_ENABLED = process.env.FEATURE_BUSINESS_ENABLED !== "false";
 
 
 
@@ -47,10 +52,15 @@ app.use("/api/media", mediaRouter);
 app.use("/api/voice", voiceRouter);
 app.use("/api/status", statusRouter);
 app.use("/api/profile", profileRouter);
-app.use("/api/business", businessRouter);
-app.use("/api/orders", ordersRouter);
-app.use("/api/ads", adsRouter);
+if (BUSINESS_ENABLED) {
+  app.use("/api/business", businessRouter);
+  app.use("/api/orders", ordersRouter);
+  app.use("/api/ads", adsRouter);
+} else {
+  console.log("[server] Business features disabled (FEATURE_BUSINESS_ENABLED=false)");
+}
 app.use("/api/safety", safetyRouter);
+app.use("/api/admin", adminRouter);
 app.use("/uploads/avatars", express.static(path.join(__dirname, "../uploads/avatars")));
 
 io.use((socket, next) => {

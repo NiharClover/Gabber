@@ -80,6 +80,10 @@ router.get("/business", async (req, res) => {
 });
 
 // PATCH /api/orders/:id/status
+// Previously ANY authenticated user could update ANY order's status —
+// there was no check that the caller owns the business the order belongs
+// to. A malicious user could mark a competitor's pending orders as
+// "cancelled"/"delivered" simply by guessing/enumerating order ids.
 router.patch("/:id/status", async (req, res) => {
   const { status } = req.body;
   const validStatuses = ["pending", "confirmed", "preparing", "ready", "delivered", "cancelled"];
@@ -87,9 +91,22 @@ router.patch("/:id/status", async (req, res) => {
     return res.status(400).json({ error: "Invalid status." });
   }
   try {
+    const order = await pool.query(
+      `SELECT o.id, b.user_id AS business_owner_id
+       FROM orders o
+       JOIN businesses b ON b.id = o.business_id
+       WHERE o.id = $1`,
+      [req.params.id]
+    );
+    if (!order.rows[0]) return res.status(404).json({ error: "Order not found." });
+    if (order.rows[0].business_owner_id !== req.user.userId) {
+      return res.status(403).json({ error: "Only the business that owns this order can update its status." });
+    }
+
     await pool.query("UPDATE orders SET status = $1 WHERE id = $2", [status, req.params.id]);
     res.json({ success: true });
   } catch (err) {
+    console.error("[orders status]", err.message);
     res.status(500).json({ error: "Server error." });
   }
 });

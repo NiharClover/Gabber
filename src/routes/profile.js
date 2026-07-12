@@ -4,15 +4,14 @@ const pool = require("../db/pool");
 const multer = require("multer");
 const path = require("path");
 const { randomUUID } = require("crypto");
+const { uploadBuffer } = require("../services/storage");
 
 const router = express.Router();
 router.use(requireAuth);
 
-const avatarStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, "uploads/avatars/"),
-  filename: (req, file, cb) => cb(null, `avatar_${randomUUID()}${path.extname(file.originalname)}`),
-});
-const avatarUpload = multer({ storage: avatarStorage, limits: { fileSize: 5 * 1024 * 1024 } });
+// Memory storage — needed so we have the raw buffer to hand to
+// uploadBuffer() (which goes to S3 or local disk depending on config).
+const avatarUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 // GET /api/profile — own profile
 router.get("/", async (req, res) => {
@@ -64,10 +63,17 @@ router.patch("/", async (req, res) => {
 router.post("/avatar", avatarUpload.single("avatar"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded." });
   try {
-    const url = `${process.env.BASE_URL || "http://localhost:3000"}/uploads/avatars/${req.file.filename}`;
+    // Previously built the URL from `process.env.BASE_URL || "http://localhost:3000"`.
+    // BASE_URL was never actually set in .env, so this ALWAYS returned
+    // "http://localhost:3000/..." — which on a phone means the phone itself,
+    // not the dev machine, so the avatar silently failed to load. uploadBuffer()
+    // builds the URL from the real request host (or a real S3/CDN URL).
+    const filename = `avatar_${randomUUID()}${path.extname(req.file.originalname)}`;
+    const url = await uploadBuffer(req.file.buffer, "avatars", filename, req.file.mimetype, req);
     await pool.query("UPDATE users SET avatar_url = $1 WHERE id = $2", [url, req.user.userId]);
     res.json({ success: true, url });
   } catch (err) {
+    console.error("[profile avatar]", err.message);
     res.status(500).json({ error: "Server error." });
   }
 });

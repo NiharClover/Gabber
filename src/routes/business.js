@@ -2,9 +2,22 @@ const express = require("express");
 const { requireAuth } = require("../middleware/auth");
 const pool = require("../db/pool");
 const { randomUUID } = require("crypto");
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
+const sharp = require("sharp");
+const { isValidGSTIN } = require("../utils/gstin");
 
 const router = express.Router();
 router.use(requireAuth);
+
+const verificationUploadDir = path.join(__dirname, "../../uploads/verification");
+if (!fs.existsSync(verificationUploadDir)) fs.mkdirSync(verificationUploadDir, { recursive: true });
+
+const verifyUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+});
 
 // POST /api/business/register
 router.post("/register", async (req, res) => {
@@ -74,11 +87,27 @@ router.post("/menu", async (req, res) => {
 });
 
 // DELETE /api/business/menu/:id
+// Previously deleted ANY menu item by id with no check that the caller
+// owns the business it belongs to — any authenticated user could delete
+// a competitor's entire menu by enumerating item ids.
 router.delete("/menu/:id", async (req, res) => {
   try {
+    const item = await pool.query(
+      `SELECT mi.id, b.user_id AS business_owner_id
+       FROM menu_items mi
+       JOIN businesses b ON b.id = mi.business_id
+       WHERE mi.id = $1`,
+      [req.params.id]
+    );
+    if (!item.rows[0]) return res.status(404).json({ error: "Menu item not found." });
+    if (item.rows[0].business_owner_id !== req.user.userId) {
+      return res.status(403).json({ error: "Not your business." });
+    }
+
     await pool.query("DELETE FROM menu_items WHERE id = $1", [req.params.id]);
     res.json({ success: true });
   } catch (err) {
+    console.error("[business menu delete]", err.message);
     res.status(500).json({ error: "Server error." });
   }
 });
@@ -93,4 +122,82 @@ router.get("/by-user/:userId", async (req, res) => {
   }
 });
 
-module.exports = router;    
+
+// ─── Business Verification (identity check — NEVER gated by payment) ─────
+// POST /api/business/:id/verify-request
+// Accepts a GSTIN + supporting documents and puts the business into the
+// manual review queue (routes/admin.js). This route intentionally never
+// reads or writes `plan`, and never checks any payment/subscription state.
+// Verification and monetization are two independent systems by design —
+// see the acceptance criteria in the verification system spec.
+router.post(
+  "/:id/verify-request",
+  verifyUpload.fields([
+    { name: "gst_certificate", maxCount: 1 },
+    { name: "address_proof", maxCount: 1 },
+    { name: "pan", maxCount: 1 },
+  ]),
+  async (req, res) => {
+    const { gstin } = req.body;
+
+    // Free, instant, zero-cost check — catches obviously fake/mistyped
+    // GSTINs before anything reaches a human reviewer or (later) a paid
+    // KYC API call.
+    if (!gstin || !isValidGSTIN(gstin)) {
+      return res.status(400).json({ error: "Invalid GSTIN format or checksum. Double-check and try again." });
+    }
+
+    try {
+      const biz = await pool.query(
+        "SELECT id, user_id, verification_status FROM businesses WHERE id = $1",
+        [req.params.id]
+      );
+      if (!biz.rows[0]) return res.status(404).json({ error: "Business not found." });
+      if (biz.rows[0].user_id !== req.user.userId) {
+        return res.status(403).json({ error: "Not your business." });
+      }
+      if (biz.rows[0].verification_status === "verified") {
+        return res.status(400).json({ error: "This business is already verified." });
+      }
+
+      const docs = [];
+      for (const field of ["gst_certificate", "address_proof", "pan"]) {
+        const file = req.files?.[field]?.[0];
+        if (!file) continue;
+        const filename = `${field}_${Date.now()}_${randomUUID().split("-")[0]}.jpg`;
+        const filepath = path.join(verificationUploadDir, filename);
+        await sharp(file.buffer)
+          .resize({ width: 1600, height: 1600, fit: "inside", withoutEnlargement: true })
+          .jpeg({ quality: 85 })
+          .toFile(filepath);
+        docs.push({
+          type: field,
+          url: `${req.protocol}://${req.get("host")}/uploads/verification/${filename}`,
+          uploaded_at: new Date().toISOString(),
+        });
+      }
+
+      if (docs.length === 0) {
+        return res.status(400).json({ error: "At least one supporting document is required." });
+      }
+
+      const result = await pool.query(
+        `UPDATE businesses
+         SET gst_number = $1,
+             verification_status = 'pending',
+             verification_docs = $2,
+             rejection_reason = NULL
+         WHERE id = $3
+         RETURNING id, verification_status`,
+        [gstin.toUpperCase(), JSON.stringify(docs), req.params.id]
+      );
+
+      res.json({ success: true, business: result.rows[0] });
+    } catch (err) {
+      console.error("[business verify-request]", err.message);
+      res.status(500).json({ error: "Server error." });
+    }
+  }
+);
+
+module.exports = router;
