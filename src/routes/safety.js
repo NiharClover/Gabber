@@ -74,8 +74,26 @@ router.post("/report/:userId", async (req, res) => {
        VALUES ($1,$2,$3,$4,$5)`,
       [id, req.user.userId, req.params.userId, reason, details || null]
     );
+
+    // Auto-FLAG (never auto-suspend) accounts accumulating 3+ open reports
+    // within 24h — just surfaces them at the top of the admin queue for
+    // faster human review. A human always makes the actual call via
+    // POST /api/admin/reports/:id/resolve.
+    const recentOpen = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM reports
+       WHERE reported_id = $1 AND status = 'open' AND created_at > NOW() - INTERVAL '24 hours'`,
+      [req.params.userId]
+    );
+    if (parseInt(recentOpen.rows[0].cnt, 10) >= 3) {
+      await pool.query(
+        "UPDATE users SET flagged_at = NOW() WHERE id = $1 AND flagged_at IS NULL",
+        [req.params.userId]
+      );
+    }
+
     res.json({ success: true });
   } catch (err) {
+    console.error("[safety report]", err.message);
     res.status(500).json({ error: "Server error." });
   }
 });

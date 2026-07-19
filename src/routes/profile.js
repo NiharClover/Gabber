@@ -3,15 +3,32 @@ const { requireAuth } = require("../middleware/auth");
 const pool = require("../db/pool");
 const multer = require("multer");
 const path = require("path");
+const sharp = require("sharp");
 const { randomUUID } = require("crypto");
 const { uploadBuffer } = require("../services/storage");
 
 const router = express.Router();
 router.use(requireAuth);
 
-// Memory storage — needed so we have the raw buffer to hand to
-// uploadBuffer() (which goes to S3 or local disk depending on config).
-const avatarUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+// SECURITY FIX: this previously had NO fileFilter and never ran the upload
+// through sharp — any file type (a disguised .html/.svg with embedded
+// script, an executable, anything) would be accepted, saved with whatever
+// extension the client's original filename had, and served back statically.
+// A malicious "avatar.svg" containing a <script> tag or "avatar.html" could
+// have been stored and then loaded directly by anyone with the URL.
+// Restricting to real image mimetypes AND re-encoding through sharp (same
+// pattern already used in media.js) closes this off — sharp will refuse to
+// process anything that isn't actually a decodable image, regardless of
+// what extension or Content-Type the upload claimed.
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+    if (allowed.includes(file.mimetype)) cb(null, true);
+    else cb(new Error("Only image files are allowed."));
+  },
+});
 
 // GET /api/profile — own profile
 router.get("/", async (req, res) => {
@@ -68,8 +85,18 @@ router.post("/avatar", avatarUpload.single("avatar"), async (req, res) => {
     // "http://localhost:3000/..." — which on a phone means the phone itself,
     // not the dev machine, so the avatar silently failed to load. uploadBuffer()
     // builds the URL from the real request host (or a real S3/CDN URL).
-    const filename = `avatar_${randomUUID()}${path.extname(req.file.originalname)}`;
-    const url = await uploadBuffer(req.file.buffer, "avatars", filename, req.file.mimetype, req);
+    let compressed;
+    try {
+      compressed = await sharp(req.file.buffer)
+        .resize({ width: 512, height: 512, fit: "cover" })
+        .jpeg({ quality: 85 })
+        .toBuffer();
+    } catch {
+      return res.status(400).json({ error: "That doesn't look like a valid image file." });
+    }
+
+    const filename = `avatar_${randomUUID()}.jpg`; // always .jpg now — re-encoded, so the original extension is irrelevant and never trusted
+    const url = await uploadBuffer(compressed, "avatars", filename, "image/jpeg", req);
     await pool.query("UPDATE users SET avatar_url = $1 WHERE id = $2", [url, req.user.userId]);
     res.json({ success: true, url });
   } catch (err) {

@@ -13,23 +13,36 @@ router.post("/", async (req, res) => {
     return res.status(400).json({ error: "businessId and items required." });
   }
   try {
-    // Calculate total
+    // SECURITY FIX: this looked up menu items by id alone, with no check
+    // that they actually belong to the submitted businessId. A client
+    // could send businessId = "Business B" together with item ids that
+    // actually belong to "Business A" — the order would be created and
+    // attributed to Business B even though none of the items are theirs,
+    // corrupting their order queue with orders they can't fulfill. Now
+    // requires every item to belong to the stated business.
     const itemIds = items.map((i) => i.id);
     const menuResult = await pool.query(
-      "SELECT * FROM menu_items WHERE id = ANY($1)",
-      [itemIds]
+      "SELECT * FROM menu_items WHERE id = ANY($1) AND business_id = $2",
+      [itemIds, businessId]
     );
     const menuMap = {};
     menuResult.rows.forEach((m) => { menuMap[m.id] = m; });
 
     let total = 0;
-    const orderItems = items.map((item) => {
-      const menuItem = menuMap[item.id];
-      if (!menuItem) throw new Error(`Item ${item.id} not found`);
-      const subtotal = menuItem.price * item.qty;
-      total += subtotal;
-      return { ...menuItem, qty: item.qty, subtotal };
-    });
+    let orderItems;
+    try {
+      orderItems = items.map((item) => {
+        const menuItem = menuMap[item.id];
+        if (!menuItem) throw new Error(`Item ${item.id} not found for this business`);
+        const subtotal = menuItem.price * item.qty;
+        total += subtotal;
+        return { ...menuItem, qty: item.qty, subtotal };
+      });
+    } catch {
+      // Don't leak which exact item id was invalid or why — just enough
+      // detail for the legitimate client to retry sensibly.
+      return res.status(400).json({ error: "One or more items are invalid for this business." });
+    }
 
     const id = `order_${randomUUID().split("-")[0]}`;
     const result = await pool.query(
@@ -41,7 +54,7 @@ router.post("/", async (req, res) => {
     res.json({ success: true, order: result.rows[0] });
   } catch (err) {
     console.error("[orders]", err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Server error." }); // was leaking raw err.message to the client
   }
 });
 

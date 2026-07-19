@@ -4,19 +4,29 @@ const pool = require("../db/pool");
 const { randomUUID } = require("crypto");
 const multer = require("multer");
 const path = require("path");
-const fs = require("fs");
 const sharp = require("sharp");
 const { isValidGSTIN } = require("../utils/gstin");
+const { uploadPrivateBuffer } = require("../services/storage");
 
 const router = express.Router();
 router.use(requireAuth);
 
-const verificationUploadDir = path.join(__dirname, "../../uploads/verification");
-if (!fs.existsSync(verificationUploadDir)) fs.mkdirSync(verificationUploadDir, { recursive: true });
-
+// SECURITY FIX: verification documents are government-ID-adjacent material
+// (GST certificates, PAN cards, address proof). This used to write them
+// straight into the PUBLIC ../uploads/verification folder and store a
+// plain, world-readable URL — anyone who obtained that URL (browser
+// history, server logs, a referrer header, a screenshot) could view
+// someone's PAN card with zero authentication. Now stored via
+// uploadPrivateBuffer(), outside the public web root, resolved only
+// through the admin-authenticated route in routes/admin.js.
 const verifyUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = ["image/jpeg", "image/png", "image/webp"];
+    if (allowed.includes(file.mimetype)) cb(null, true);
+    else cb(new Error("Only JPEG, PNG, or WEBP images are allowed."));
+  },
 });
 
 // POST /api/business/register
@@ -164,15 +174,25 @@ router.post(
       for (const field of ["gst_certificate", "address_proof", "pan"]) {
         const file = req.files?.[field]?.[0];
         if (!file) continue;
+
+        let compressed;
+        try {
+          compressed = await sharp(file.buffer)
+            .resize({ width: 1600, height: 1600, fit: "inside", withoutEnlargement: true })
+            .jpeg({ quality: 85 })
+            .toBuffer();
+        } catch (imgErr) {
+          // sharp throws on anything it can't decode as an image — this is
+          // also what actually stops a disguised non-image file from
+          // getting through, on top of the mimetype fileFilter above.
+          return res.status(400).json({ error: `${field.replace("_", " ")} doesn't look like a valid image file.` });
+        }
+
         const filename = `${field}_${Date.now()}_${randomUUID().split("-")[0]}.jpg`;
-        const filepath = path.join(verificationUploadDir, filename);
-        await sharp(file.buffer)
-          .resize({ width: 1600, height: 1600, fit: "inside", withoutEnlargement: true })
-          .jpeg({ quality: 85 })
-          .toFile(filepath);
+        const key = await uploadPrivateBuffer(compressed, "verification", filename, "image/jpeg");
         docs.push({
           type: field,
-          url: `${req.protocol}://${req.get("host")}/uploads/verification/${filename}`,
+          key, // opaque storage key — resolved only via the admin-authenticated route, never a public URL
           uploaded_at: new Date().toISOString(),
         });
       }

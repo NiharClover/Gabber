@@ -4,12 +4,23 @@ const pool = require("../db/pool");
 const { randomUUID } = require("crypto");
 const multer = require("multer");
 const path = require("path");
+const sharp = require("sharp");
 const { uploadBuffer } = require("../services/storage");
 
 const router = express.Router();
 router.use(requireAuth);
 
-const groupAvatarUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+// Same fix as profile.js avatars — fileFilter + sharp re-encode instead of
+// accepting and storing any file type verbatim.
+const groupAvatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+    if (allowed.includes(file.mimetype)) cb(null, true);
+    else cb(new Error("Only image files are allowed."));
+  },
+});
 
 // POST /api/groups — create group
 router.post("/", async (req, res) => {
@@ -85,8 +96,17 @@ router.post("/:chatId/avatar", groupAvatarUpload.single("avatar"), async (req, r
     );
     if (adminCheck.rows[0]?.role !== "admin") return res.status(403).json({ error: "Admin only." });
     // Same localhost-URL bug as profile.js avatars — fixed via uploadBuffer().
-    const filename = `group_${randomUUID()}${path.extname(req.file.originalname)}`;
-    const url = await uploadBuffer(req.file.buffer, "avatars", filename, req.file.mimetype, req);
+    let compressed;
+    try {
+      compressed = await sharp(req.file.buffer)
+        .resize({ width: 512, height: 512, fit: "cover" })
+        .jpeg({ quality: 85 })
+        .toBuffer();
+    } catch {
+      return res.status(400).json({ error: "That doesn't look like a valid image file." });
+    }
+    const filename = `group_${randomUUID()}.jpg`;
+    const url = await uploadBuffer(compressed, "avatars", filename, "image/jpeg", req);
     await pool.query("UPDATE chats SET avatar_url = $1 WHERE id = $2", [url, req.params.chatId]);
     res.json({ success: true, url });
   } catch (err) {

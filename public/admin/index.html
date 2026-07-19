@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Gabber Admin</title>
+<style>
+  :root {
+    --bg-primary: #0a0f1e;
+    --bg-secondary: #0d1428;
+    --bg-card: #12182c;
+    --border: rgba(255,255,255,0.08);
+    --accent: #ff6b35;
+    --accent-muted: rgba(255,107,53,0.12);
+    --text-primary: #ffffff;
+    --text-secondary: rgba(255,255,255,0.6);
+    --text-muted: rgba(255,255,255,0.35);
+    --green: #22c55e;
+    --red: #ef4444;
+    --amber: #f59e0b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg-primary); color: var(--text-primary); min-height: 100vh;
+  }
+  .hidden { display: none !important; }
+
+  /* ─── Login screen ─── */
+  #loginScreen { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+  .login-card { width: 100%; max-width: 380px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 20px; padding: 32px; }
+  .logo { font-size: 28px; font-weight: 800; margin-bottom: 4px; }
+  .logo span { color: var(--accent); }
+  .login-sub { color: var(--text-secondary); font-size: 14px; margin-bottom: 28px; }
+  label { display: block; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-secondary); margin-bottom: 8px; margin-top: 18px; }
+  input[type=text], input[type=tel], textarea, select {
+    width: 100%; background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 14px; color: var(--text-primary); font-size: 15px; font-family: inherit;
+  }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
+  button {
+    cursor: pointer; border: none; border-radius: 12px; padding: 13px 18px; font-size: 14px; font-weight: 700;
+    font-family: inherit;
+  }
+  .btn-primary { background: var(--accent); color: #fff; width: 100%; margin-top: 22px; }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  .error-text { color: var(--red); font-size: 13px; margin-top: 10px; min-height: 16px; }
+
+  /* ─── Shell ─── */
+  #appShell { display: none; }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; background: var(--bg-secondary); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; }
+  header .logo { font-size: 20px; margin: 0; }
+  .logout-btn { background: transparent; border: 1px solid var(--border); color: var(--text-secondary); }
+  nav { display: flex; gap: 4px; padding: 12px 24px 0; background: var(--bg-secondary); border-bottom: 1px solid var(--border); overflow-x: auto; }
+  nav button { background: transparent; color: var(--text-secondary); border-radius: 10px 10px 0 0; padding: 10px 16px; white-space: nowrap; }
+  nav button.active { background: var(--bg-primary); color: var(--accent); }
+  main { max-width: 1000px; margin: 0 auto; padding: 24px; }
+
+  .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 16px; padding: 18px; margin-bottom: 14px; }
+  .card-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 10px; }
+  .badge { display: inline-block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; padding: 3px 8px; border-radius: 6px; }
+  .badge-flagged { background: rgba(239,68,68,0.15); color: var(--red); }
+  .badge-open { background: rgba(245,158,11,0.15); color: var(--amber); }
+  .field-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 2px; }
+  .field-value { font-size: 14px; color: var(--text-primary); margin-bottom: 10px; }
+  .muted { color: var(--text-muted); font-size: 13px; }
+  .empty-state { text-align: center; padding: 60px 20px; color: var(--text-muted); }
+  .btn-row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  .btn-sm { padding: 8px 14px; font-size: 13px; }
+  .btn-approve { background: var(--green); color: #fff; }
+  .btn-reject { background: var(--red); color: #fff; }
+  .btn-neutral { background: rgba(255,255,255,0.08); color: var(--text-primary); }
+  .doc-thumbs { display: flex; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
+  .doc-thumb { width: 90px; height: 90px; border-radius: 10px; object-fit: cover; border: 1px solid var(--border); background: rgba(255,255,255,0.04); cursor: pointer; }
+  .doc-thumb-label { font-size: 10px; color: var(--text-muted); text-align: center; margin-top: 4px; }
+  .resolve-form { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); display: none; }
+  .resolve-form.open { display: block; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 8px 10px; color: var(--text-muted); font-weight: 600; border-bottom: 1px solid var(--border); }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  .loading { text-align: center; padding: 40px; color: var(--text-muted); }
+  .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); padding: 12px 20px; border-radius: 12px; font-size: 14px; font-weight: 600; color: #fff; z-index: 100; opacity: 0; transition: opacity 0.25s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .toast.success { background: var(--green); }
+  .toast.error { background: var(--red); }
+
+  /* lightbox for doc images */
+  #lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.9); z-index: 200; align-items: center; justify-content: center; padding: 24px; cursor: zoom-out; }
+  #lightbox.open { display: flex; }
+  #lightbox img { max-width: 100%; max-height: 100%; border-radius: 8px; }
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════ LOGIN ═══════════════════ -->
+<div id="loginScreen">
+  <div class="login-card">
+    <div class="logo">Gabb<span>er</span> Admin</div>
+    <div class="login-sub">Sign in with your Gabber account</div>
+
+    <div id="phoneStep">
+      <label>Phone number</label>
+      <input type="tel" id="phoneInput" placeholder="+919876543210" autocomplete="off" />
+      <button class="btn-primary" id="sendOtpBtn">Send OTP</button>
+      <div class="error-text" id="phoneError"></div>
+    </div>
+
+    <div id="otpStep" class="hidden">
+      <label>Enter the 6-digit code</label>
+      <input type="text" id="otpInput" placeholder="123456" maxlength="6" autocomplete="off" />
+      <button class="btn-primary" id="verifyOtpBtn">Verify &amp; Sign In</button>
+      <div class="error-text" id="otpError"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════ APP SHELL ═══════════════════ -->
+<div id="appShell">
+  <header>
+    <div class="logo">Gabb<span>er</span> Admin</div>
+    <button class="logout-btn" id="logoutBtn">Log out</button>
+  </header>
+
+  <nav id="tabNav">
+    <button data-tab="reports" class="active">Reports</button>
+    <button data-tab="flagged">Flagged Users</button>
+    <button data-tab="businesses">Business Verification</button>
+    <button data-tab="fraud">Fraud Signals</button>
+  </nav>
+
+  <main>
+    <div id="notAdminNotice" class="empty-state hidden">
+      This account isn't an admin. Ask an existing admin to run:<br/>
+      <code>UPDATE users SET is_admin = TRUE WHERE phone = '+91...';</code>
+    </div>
+
+    <div id="tab-reports" class="tab-content"></div>
+    <div id="tab-flagged" class="tab-content hidden"></div>
+    <div id="tab-businesses" class="tab-content hidden"></div>
+    <div id="tab-fraud" class="tab-content hidden"></div>
+  </main>
+</div>
+
+<div id="lightbox"><img id="lightboxImg" src="" /></div>
+<div class="toast" id="toast"></div>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────
+// Same-origin API — this page is served by the same Express app it talks
+// to, so relative paths work in every environment (local dev, staging,
+// prod) without any config.
+const API = "";
+
+// ─── XSS PREVENTION ─────────────────────────────────────────────────────
+// Every piece of user-supplied text (report reasons/details, business
+// names/addresses, usernames, phone numbers, rejection reasons) MUST go
+// through this before being inserted via innerHTML. A report's "details"
+// field or a business's "name" field is attacker-controlled input —
+// without escaping, a malicious string like <img src=x onerror=...> in a
+// report would execute in THIS admin session the moment the queue loads,
+// which is a far higher-value target than the regular app.
+function escapeHtml(str) {
+  if (str === null || str === undefined) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function getToken() { return localStorage.getItem("gabber_admin_token"); }
+function setToken(t) { localStorage.setItem("gabber_admin_token", t); }
+function clearToken() { localStorage.removeItem("gabber_admin_token"); }
+
+async function api(path, options = {}) {
+  const res = await fetch(API + path, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: "Bearer " + getToken(),
+      ...(options.headers || {}),
+    },
+  });
+  if (res.status === 401) {
+    clearToken();
+    showLogin();
+    throw new Error("Session expired — please log in again.");
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "Request failed");
+  return data;
+}
+
+function showToast(message, type = "success") {
+  const el = document.getElementById("toast");
+  el.textContent = message;
+  el.className = "toast show " + type;
+  setTimeout(() => { el.className = "toast " + type; }, 2200);
+}
+
+// ─── Auth flow — reuses the exact same OTP endpoints as the mobile app ───
+document.getElementById("sendOtpBtn").addEventListener("click", async () => {
+  const phone = document.getElementById("phoneInput").value.trim();
+  const errEl = document.getElementById("phoneError");
+  errEl.textContent = "";
+  if (!/^\+[1-9]\d{9,14}$/.test(phone)) {
+    errEl.textContent = "Enter a valid phone number in +91XXXXXXXXXX format.";
+    return;
+  }
+  try {
+    const res = await fetch(API + "/api/auth/send-otp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ phone }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Failed to send OTP");
+    window._pendingPhone = phone;
+    document.getElementById("phoneStep").classList.add("hidden");
+    document.getElementById("otpStep").classList.remove("hidden");
+  } catch (err) {
+    errEl.textContent = err.message;
+  }
+});
+
+document.getElementById("verifyOtpBtn").addEventListener("click", async () => {
+  const otp = document.getElementById("otpInput").value.trim();
+  const errEl = document.getElementById("otpError");
+  errEl.textContent = "";
+  try {
+    const res = await fetch(API + "/api/auth/verify-otp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ phone: window._pendingPhone, otp }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Invalid OTP");
+    setToken(data.token);
+    await checkAdminAndShowApp();
+  } catch (err) {
+    errEl.textContent = err.message;
+  }
+});
+
+document.getElementById("logoutBtn").addEventListener("click", () => {
+  clearToken();
+  showLogin();
+});
+
+function showLogin() {
+  document.getElementById("loginScreen").style.display = "flex";
+  document.getElementById("appShell").style.display = "none";
+  document.getElementById("phoneStep").classList.remove("hidden");
+  document.getElementById("otpStep").classList.add("hidden");
+  document.getElementById("phoneInput").value = "";
+  document.getElementById("otpInput").value = "";
+}
+
+async function checkAdminAndShowApp() {
+  try {
+    // Cheapest possible admin check — this call is gated by requireAdmin
+    // server-side, so a 403 here means "not an admin," authoritatively.
+    await api("/api/admin/reports/flagged-users");
+    document.getElementById("loginScreen").style.display = "none";
+    document.getElementById("appShell").style.display = "block";
+    document.getElementById("notAdminNotice").classList.add("hidden");
+    loadTab("reports");
+  } catch (err) {
+    document.getElementById("loginScreen").style.display = "none";
+    document.getElementById("appShell").style.display = "block";
+    document.getElementById("notAdminNotice").classList.remove("hidden");
+    document.querySelectorAll(".tab-content").forEach((el) => el.classList.add("hidden"));
+  }
+}
+
+// ─── Tabs ───────────────────────────────────────────────────────────────
+document.getElementById("tabNav").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-tab]");
+  if (!btn) return;
+  document.querySelectorAll("#tabNav button").forEach((b) => b.classList.remove("active"));
+  btn.classList.add("active");
+  document.querySelectorAll(".tab-content").forEach((el) => el.classList.add("hidden"));
+  document.getElementById("tab-" + btn.dataset.tab).classList.remove("hidden");
+  loadTab(btn.dataset.tab);
+});
+
+function loadTab(tab) {
+  if (tab === "reports") loadReports();
+  else if (tab === "flagged") loadFlagged();
+  else if (tab === "businesses") loadBusinesses();
+  else if (tab === "fraud") loadFraud();
+}
+
+// ─── Reports tab ────────────────────────────────────────────────────────
+async function loadReports() {
+  const el = document.getElementById("tab-reports");
+  el.innerHTML = '<div class="loading">Loading reports...</div>';
+  try {
+    const { reports } = await api("/api/admin/reports?status=open");
+    if (reports.length === 0) {
+      el.innerHTML = '<div class="empty-state">No open reports. 🎉</div>';
+      return;
+    }
+    el.innerHTML = reports.map((r) => `
+      <div class="card" data-report-id="${escapeHtml(r.id)}">
+        <div class="card-row">
+          <div>
+            <div style="font-weight:700;font-size:15px;">${escapeHtml(r.reported_name)}
+              ${r.reported_flagged_at ? '<span class="badge badge-flagged" style="margin-left:6px;">Flagged</span>' : ""}
+            </div>
+            <div class="muted">${escapeHtml(r.reported_phone)}</div>
+          </div>
+          <span class="badge badge-open">Open</span>
+        </div>
+        <div class="field-label">Reported by</div>
+        <div class="field-value">${escapeHtml(r.reporter_name)} (${escapeHtml(r.reporter_phone)})</div>
+        <div class="field-label">Reason</div>
+        <div class="field-value">${escapeHtml(r.reason)}</div>
+        ${r.details ? `<div class="field-label">Details</div><div class="field-value">${escapeHtml(r.details)}</div>` : ""}
+        <div class="muted">Reported ${escapeHtml(new Date(r.created_at).toLocaleString())}</div>
+
+        <div class="btn-row">
+          <button class="btn-sm btn-neutral" onclick="toggleResolveForm('${escapeHtml(r.id)}')">Resolve...</button>
+        </div>
+
+        <div class="resolve-form" id="resolve-${escapeHtml(r.id)}">
+          <label>Resolution</label>
+          <select id="status-${escapeHtml(r.id)}">
+            <option value="dismissed">Dismissed — no action needed</option>
+            <option value="reviewed">Reviewed — noted, monitoring</option>
+            <option value="actioned">Actioned — took action on this account</option>
+          </select>
+          <label>Notes (optional)</label>
+          <textarea id="notes-${escapeHtml(r.id)}" rows="2" placeholder="What did you do about this?"></textarea>
+          <div class="btn-row">
+            <button class="btn-sm btn-approve" onclick="resolveReport('${escapeHtml(r.id)}')">Submit</button>
+          </div>
+        </div>
+      </div>
+    `).join("");
+  } catch (err) {
+    el.innerHTML = `<div class="empty-state">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function toggleResolveForm(id) {
+  document.getElementById("resolve-" + id).classList.toggle("open");
+}
+
+async function resolveReport(id) {
+  const status = document.getElementById("status-" + id).value;
+  const action_taken = document.getElementById("notes-" + id).value.trim();
+  try {
+    await api(`/api/admin/reports/${id}/resolve`, {
+      method: "POST",
+      body: JSON.stringify({ status, action_taken }),
+    });
+    showToast("Report resolved", "success");
+    loadReports();
+  } catch (err) {
+    showToast(err.message, "error");
+  }
+}
+
+// ─── Flagged users tab ──────────────────────────────────────────────────
+async function loadFlagged() {
+  const el = document.getElementById("tab-flagged");
+  el.innerHTML = '<div class="loading">Loading...</div>';
+  try {
+    const { flaggedUsers } = await api("/api/admin/reports/flagged-users");
+    if (flaggedUsers.length === 0) {
+      el.innerHTML = '<div class="empty-state">No flagged accounts.</div>';
+      return;
+    }
+    el.innerHTML = `
+      <table><thead><tr>
+        <th>User</th><th>Phone</th><th>Flagged</th><th>Open reports</th><th>Total reports</th>
+      </tr></thead><tbody>
+        ${flaggedUsers.map((u) => `
+          <tr>
+            <td>${escapeHtml(u.username)}</td>
+            <td>${escapeHtml(u.phone)}</td>
+            <td>${escapeHtml(new Date(u.flagged_at).toLocaleDateString())}</td>
+            <td>${escapeHtml(u.open_report_count)}</td>
+            <td>${escapeHtml(u.total_report_count)}</td>
+          </tr>
+        `).join("")}
+      </tbody></table>
+    `;
+  } catch (err) {
+    el.innerHTML = `<div class="empty-state">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+// ─── Business verification tab ─────────────────────────────────────────
+async function loadBusinesses() {
+  const el = document.getElementById("tab-businesses");
+  el.innerHTML = '<div class="loading">Loading...</div>';
+  try {
+    const { businesses } = await api("/api/admin/businesses/pending");
+    if (businesses.length === 0) {
+      el.innerHTML = '<div class="empty-state">No pending verifications.</div>';
+      return;
+    }
+    el.innerHTML = businesses.map((b) => `
+      <div class="card">
+        <div class="card-row">
+          <div style="font-weight:700;font-size:15px;">${escapeHtml(b.name)}</div>
+          <span class="badge badge-open">Pending</span>
+        </div>
+        <div class="field-label">Owner phone</div>
+        <div class="field-value">${escapeHtml(b.phone || "—")}</div>
+        <div class="field-label">GSTIN</div>
+        <div class="field-value">${escapeHtml(b.gst_number || "—")}</div>
+        <div class="field-label">Address</div>
+        <div class="field-value">${escapeHtml(b.address || "")}, ${escapeHtml(b.city || "")} ${escapeHtml(b.pincode || "")}</div>
+
+        <div class="field-label">Documents</div>
+        <div class="doc-thumbs">
+          ${(b.verification_docs || []).map((doc, i) => `
+            <div>
+              <img class="doc-thumb" data-business-id="${escapeHtml(b.id)}" data-doc-index="${i}"
+                   onclick="openDoc(this)" alt="${escapeHtml(doc.type)}" />
+              <div class="doc-thumb-label">${escapeHtml(doc.type)}</div>
+            </div>
+          `).join("")}
+        </div>
+
+        <div class="btn-row">
+          <button class="btn-sm btn-approve" onclick="approveBusiness('${escapeHtml(b.id)}', '${escapeHtml(b.name)}')">Approve</button>
+          <button class="btn-sm btn-reject" onclick="rejectBusiness('${escapeHtml(b.id)}', '${escapeHtml(b.name)}')">Reject</button>
+        </div>
+      </div>
+    `).join("");
+
+    // Doc thumbnails are loaded via authenticated fetch → blob URL, since a
+    // plain <img src="/api/admin/verification-docs/..."> can't attach the
+    // Authorization header a browser needs to pass admin auth.
+    document.querySelectorAll(".doc-thumb").forEach(loadDocThumb);
+  } catch (err) {
+    el.innerHTML = `<div class="empty-state">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+async function loadDocThumb(imgEl) {
+  const businessId = imgEl.dataset.businessId;
+  const index = imgEl.dataset.docIndex;
+  try {
+    const res = await fetch(`${API}/api/admin/verification-docs/${businessId}/${index}`, {
+      headers: { Authorization: "Bearer " + getToken() },
+    });
+    if (!res.ok) return;
+    const blob = await res.blob();
+    imgEl.src = URL.createObjectURL(blob);
+  } catch {}
+}
+
+function openDoc(imgEl) {
+  document.getElementById("lightboxImg").src = imgEl.src;
+  document.getElementById("lightbox").classList.add("open");
+}
+document.getElementById("lightbox").addEventListener("click", () => {
+  document.getElementById("lightbox").classList.remove("open");
+});
+
+async function approveBusiness(id, name) {
+  if (!confirm(`Approve verification for "${name}"?`)) return;
+  try {
+    await api(`/api/admin/businesses/${id}/verify`, {
+      method: "POST",
+      body: JSON.stringify({ approve: true }),
+    });
+    showToast("Business verified", "success");
+    loadBusinesses();
+  } catch (err) {
+    showToast(err.message, "error");
+  }
+}
+
+async function rejectBusiness(id, name) {
+  const reason = prompt(`Why is "${name}" being rejected? (required)`);
+  if (!reason || !reason.trim()) return;
+  try {
+    await api(`/api/admin/businesses/${id}/verify`, {
+      method: "POST",
+      body: JSON.stringify({ approve: false, rejection_reason: reason.trim() }),
+    });
+    showToast("Business rejected", "success");
+    loadBusinesses();
+  } catch (err) {
+    showToast(err.message, "error");
+  }
+}
+
+// ─── Fraud signals tab ──────────────────────────────────────────────────
+async function loadFraud() {
+  const el = document.getElementById("tab-fraud");
+  el.innerHTML = '<div class="loading">Loading...</div>';
+  try {
+    const data = await api("/api/admin/fraud-signals");
+    const sections = [
+      { title: "Multiple businesses from the same owner (30d)", rows: data.multiBusinessOwners, cols: ["user_id", "business_count"] },
+      { title: "Order spikes shortly after verification", rows: data.verifiedOrderSpikes, cols: ["name", "order_count", "verified_at"] },
+      { title: "GSTIN reused across listings", rows: data.reusedGstins, cols: ["gst_number", "listing_count"] },
+    ];
+    el.innerHTML = sections.map((s) => `
+      <div class="card">
+        <div style="font-weight:700;margin-bottom:10px;">${escapeHtml(s.title)}</div>
+        ${s.rows.length === 0
+          ? '<div class="muted">Nothing to show.</div>'
+          : `<table><thead><tr>${s.cols.map((c) => `<th>${escapeHtml(c)}</th>`).join("")}</tr></thead><tbody>
+              ${s.rows.map((r) => `<tr>${s.cols.map((c) => `<td>${escapeHtml(r[c])}</td>`).join("")}</tr>`).join("")}
+            </tbody></table>`
+        }
+      </div>
+    `).join("");
+  } catch (err) {
+    el.innerHTML = `<div class="empty-state">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+// ─── Boot ───────────────────────────────────────────────────────────────
+if (getToken()) {
+  checkAdminAndShowApp();
+} else {
+  showLogin();
+}
+</script>
+</body>
+</html>

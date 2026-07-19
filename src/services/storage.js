@@ -113,4 +113,75 @@ async function deleteFile(urlOrFilename, subfolder = "") {
   }
 }
 
-module.exports = { uploadBuffer, deleteFile, USE_S3 };
+module.exports = { uploadBuffer, deleteFile, uploadPrivateBuffer, getPrivateFileAccess, USE_S3 };
+
+// ─── Private storage — for sensitive documents that must NEVER be ─────────
+// ─── reachable via a guessable public URL (GST certificates, PAN cards,   ─
+// ─── address proof photos). Unlike uploadBuffer() above, these are never ─
+// ─── served through the public /uploads static mount — only through the ─
+// ─── admin-authenticated route in routes/admin.js.                       ─
+
+const PRIVATE_LOCAL_ROOT = path.join(__dirname, "../../uploads_private");
+
+/**
+ * Stores a buffer outside the public web root. Returns an opaque storage
+ * KEY (not a URL) — callers must save this key and later resolve it via
+ * getPrivateFileAccess(), gated behind an auth check of their own choosing.
+ */
+async function uploadPrivateBuffer(buffer, subfolder, filename, contentType) {
+  if (USE_S3 && s3Client) {
+    const key = `private/${subfolder}/${filename}`;
+    await s3Client.send(
+      new PutObjectCommand({
+        Bucket: process.env.AWS_S3_BUCKET,
+        Key: key,
+        Body: buffer,
+        ContentType: contentType,
+        // Deliberately no public-read here. The bucket's default policy
+        // should not grant public access to the "private/" prefix at all —
+        // access is only ever via the short-lived signed URL below.
+      })
+    );
+    return key;
+  }
+
+  const dir = path.join(PRIVATE_LOCAL_ROOT, subfolder);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, filename), buffer);
+  return `${subfolder}/${filename}`;
+}
+
+/**
+ * Resolves a private storage key into something a route can serve, WITHOUT
+ * ever exposing a permanent public URL. Caller is responsible for checking
+ * the requester is actually authorized before calling this.
+ *
+ * Returns:
+ *   { type: "file", path } — call res.sendFile(path)   [local disk mode]
+ *   { type: "redirect", url } — call res.redirect(url)  [S3 mode, signed, ~5min]
+ *   null — file not found
+ */
+async function getPrivateFileAccess(key) {
+  if (USE_S3 && s3Client) {
+    try {
+      const { GetObjectCommand } = require("@aws-sdk/client-s3");
+      const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+      const url = await getSignedUrl(
+        s3Client,
+        new GetObjectCommand({ Bucket: process.env.AWS_S3_BUCKET, Key: key }),
+        { expiresIn: 300 }
+      );
+      return { type: "redirect", url };
+    } catch (err) {
+      console.error(
+        "[storage] Failed to sign private URL — run `npm install @aws-sdk/s3-request-presigner`:",
+        err.message
+      );
+      throw err;
+    }
+  }
+
+  const filepath = path.join(PRIVATE_LOCAL_ROOT, key);
+  if (!fs.existsSync(filepath)) return null;
+  return { type: "file", path: filepath };
+}
