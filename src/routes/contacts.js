@@ -1,5 +1,5 @@
 const express = require("express");
-const rateLimit = require("express-rate-limit");
+const { rateLimit, ipKeyGenerator } = require("express-rate-limit");
 const { requireAuth } = require("../middleware/auth");
 const pool = require("../db/pool");
 
@@ -19,7 +19,7 @@ const MAX_PHONES_PER_SYNC = 3000;
 const contactsSyncLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 12, // generous for real usage (app syncs on load + manual refresh), tight for scripted enumeration
-  keyGenerator: (req) => req.user?.userId || req.ip,
+  keyGenerator: (req) => req.user?.userId || ipKeyGenerator(req.ip),
   message: { error: "Too many contact syncs. Try again in a few minutes." },
 });
 
