@@ -358,6 +358,25 @@ function registerHandlers(io, socket) {
     const recipientSocket = findSocketByUserId(io, to);
     recipientSocket?.emit("call:rejected", { from: socket.userId });
   });
+
+  // ─── In-call drawing overlay ─────────────────────────────────────
+  // Pure relay, no DB persistence — annotations are ephemeral, live only
+  // as long as the call does. Same "find the other party's socket and
+  // forward" pattern as the ICE/offer/answer relays above.
+  socket.on("call:draw:point", ({ to, strokeId, x, y, color }) => {
+    const recipientSocket = findSocketByUserId(io, to);
+    recipientSocket?.emit("call:draw:point", { from: socket.userId, strokeId, x, y, color });
+  });
+
+  socket.on("call:draw:end", ({ to, strokeId }) => {
+    const recipientSocket = findSocketByUserId(io, to);
+    recipientSocket?.emit("call:draw:end", { from: socket.userId, strokeId });
+  });
+
+  socket.on("call:draw:clear", ({ to }) => {
+    const recipientSocket = findSocketByUserId(io, to);
+    recipientSocket?.emit("call:draw:clear", { from: socket.userId });
+  });
 }
 
 module.exports = { registerHandlers };
