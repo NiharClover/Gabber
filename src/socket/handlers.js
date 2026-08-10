@@ -363,9 +363,10 @@ function registerHandlers(io, socket) {
   // Pure relay, no DB persistence — annotations are ephemeral, live only
   // as long as the call does. Same "find the other party's socket and
   // forward" pattern as the ICE/offer/answer relays above.
-  socket.on("call:draw:point", ({ to, strokeId, x, y, color }) => {
+  socket.on("call:draw:point", ({ to, strokeId, x, y, color, width }) => {
     const recipientSocket = findSocketByUserId(io, to);
-    recipientSocket?.emit("call:draw:point", { from: socket.userId, strokeId, x, y, color });
+    console.log(`[call:draw] ${socket.userId} -> ${to} | strokeId=${strokeId} | recipient socket found: ${!!recipientSocket}`);
+    recipientSocket?.emit("call:draw:point", { from: socket.userId, strokeId, x, y, color, width });
   });
 
   socket.on("call:draw:end", ({ to, strokeId }) => {
@@ -376,6 +377,26 @@ function registerHandlers(io, socket) {
   socket.on("call:draw:clear", ({ to }) => {
     const recipientSocket = findSocketByUserId(io, to);
     recipientSocket?.emit("call:draw:clear", { from: socket.userId });
+  });
+
+  // ─── Screenshot unlock consent handshake ─────────────────────────
+  // Pure relays, same "find the other party's socket and forward" pattern
+  // as the draw and call-signaling events above. The server doesn't track
+  // or enforce any consent state itself — it's just carrying messages
+  // between the two clients, who each manage their own local decision.
+  socket.on("call:screenshot:request", ({ to }) => {
+    const recipientSocket = findSocketByUserId(io, to);
+    recipientSocket?.emit("call:screenshot:request", { from: socket.userId });
+  });
+
+  socket.on("call:screenshot:response", ({ to, approved }) => {
+    const recipientSocket = findSocketByUserId(io, to);
+    recipientSocket?.emit("call:screenshot:response", { from: socket.userId, approved });
+  });
+
+  socket.on("call:screenshot:relock", ({ to }) => {
+    const recipientSocket = findSocketByUserId(io, to);
+    recipientSocket?.emit("call:screenshot:relock", { from: socket.userId });
   });
 }
 
