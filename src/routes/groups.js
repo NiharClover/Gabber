@@ -50,6 +50,18 @@ router.get("/:chatId", async (req, res) => {
     );
     if (!group.rows[0]) return res.status(404).json({ error: "Group not found." });
 
+    // SECURITY FIX: this previously returned group info AND the full member
+    // list — including phone numbers — to ANY authenticated user, not just
+    // members of the group. Any logged-in user could enumerate group ids
+    // and harvest every member's phone number.
+    const membership = await pool.query(
+      "SELECT 1 FROM chat_members WHERE chat_id = $1 AND user_id = $2",
+      [req.params.chatId, req.user.userId]
+    );
+    if (!membership.rows[0]) {
+      return res.status(403).json({ error: "Not a member of this group." });
+    }
+
     const members = await pool.query(
       `SELECT cm.user_id, cm.role, u.username, u.phone, u.avatar_url
        FROM chat_members cm

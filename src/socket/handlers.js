@@ -10,6 +10,28 @@ function findSocketByUserId(io, userId) {
   return null;
 }
 
+// ─── Active call session tracking ──────────────────────────────────────
+// SECURITY FIX: call signaling (offer/answer/ICE/end/reject) and the
+// in-call extras (drawing, screenshot consent) previously relayed to
+// whatever "to" userId was supplied with NO check that the two users are
+// actually in a call together. Any authenticated socket could inject
+// call:ice / call:draw:point / call:screenshot:request etc. at another
+// user at any time, not just during a real call with them. This in-memory
+// map tracks which user pairs currently have an active call, so those
+// events can be rejected outside that window. Deliberately in-memory only
+// (not persisted) — calls are inherently ephemeral, and this is scoped to
+// a single server process; if/when the Socket.IO Redis adapter is added
+// for multi-instance PM2 clustering, this map should move there too.
+const activeCalls = new Map(); // key: sorted "userA:userB" -> { caller, callee }
+
+function callKey(userA, userB) {
+  return [userA, userB].sort().join(":");
+}
+
+function hasActiveCall(userA, userB) {
+  return activeCalls.has(callKey(userA, userB));
+}
+
 async function getPushToken(userId) {
   try {
     const result = await pool.query(
@@ -49,6 +71,15 @@ function registerHandlers(io, socket) {
   socket.on("disconnect", () => {
     console.log(`[socket] disconnected: ${socket.userId}`);
     io.emit("user:offline", { userId: socket.userId, lastSeen: Date.now() });
+    // Clean up any active call sessions this user was part of, so a dead
+    // connection doesn't leave a phantom "active call" entry that either
+    // blocks a real future call between the same two people or (more
+    // importantly) never gets cleaned up at all.
+    for (const [key, session] of activeCalls) {
+      if (session.caller === socket.userId || session.callee === socket.userId) {
+        activeCalls.delete(key);
+      }
+    }
   });
 
   // ─── Typing ──────────────────────────────────────────────
@@ -225,6 +256,17 @@ function registerHandlers(io, socket) {
   // ─── Read receipts ───────────────────────────────────────
   socket.on("messages:read", async ({ chatId, fromUserId }) => {
     try {
+      // SECURITY FIX: previously trusted the chatId/fromUserId in the
+      // payload with no check that the caller actually belongs to this
+      // chat — any authenticated socket could mark arbitrary chats' messages
+      // as read and generate false read receipts for other people's
+      // conversations.
+      const membership = await pool.query(
+        "SELECT 1 FROM chat_members WHERE chat_id=$1 AND user_id=$2",
+        [chatId, socket.userId]
+      );
+      if (!membership.rows[0]) return;
+
       const result = await pool.query(
         `UPDATE messages SET status='read'
          WHERE chat_id=$1 AND sender_id=$2 AND status!='read'
@@ -283,6 +325,16 @@ function registerHandlers(io, socket) {
       const text = `[sticker]${svg}`;
 
       if (isGroup) {
+        // SECURITY FIX: normal group text messages already verify the
+        // sender is a chat member (see group:message:send above) — this
+        // path skipped that check entirely, letting any authenticated
+        // socket inject a sticker into any group by guessing its chatId.
+        const memberCheck = await pool.query(
+          "SELECT 1 FROM chat_members WHERE chat_id=$1 AND user_id=$2",
+          [chatId, socket.userId]
+        );
+        if (!memberCheck.rows[0]) return;
+
         const members = await pool.query(
           "SELECT user_id FROM chat_members WHERE chat_id=$1 AND user_id!=$2",
           [chatId, socket.userId]
@@ -328,6 +380,7 @@ function registerHandlers(io, socket) {
     const recipientSocket = findSocketByUserId(io, to);
     console.log(`[call] offer from ${socket.userId} to ${to} — recipient found: ${!!recipientSocket}`);
     if (recipientSocket) {
+      activeCalls.set(callKey(socket.userId, to), { caller: socket.userId, callee: to });
       recipientSocket.emit("call:incoming", {
         from: socket.userId,
         fromName: socket.username,
@@ -340,11 +393,13 @@ function registerHandlers(io, socket) {
   });
 
   socket.on("call:answer", ({ to, answer }) => {
+    if (!hasActiveCall(socket.userId, to)) return;
     const recipientSocket = findSocketByUserId(io, to);
     recipientSocket?.emit("call:answered", { answer });
   });
 
   socket.on("call:ice", ({ to, candidate }) => {
+    if (!hasActiveCall(socket.userId, to)) return;
     const recipientSocket = findSocketByUserId(io, to);
     recipientSocket?.emit("call:ice", { candidate });
   });
@@ -352,11 +407,13 @@ function registerHandlers(io, socket) {
   socket.on("call:end", ({ to }) => {
     const recipientSocket = findSocketByUserId(io, to);
     recipientSocket?.emit("call:ended", { from: socket.userId });
+    activeCalls.delete(callKey(socket.userId, to));
   });
 
   socket.on("call:reject", ({ to }) => {
     const recipientSocket = findSocketByUserId(io, to);
     recipientSocket?.emit("call:rejected", { from: socket.userId });
+    activeCalls.delete(callKey(socket.userId, to));
   });
 
   // ─── In-call drawing overlay ─────────────────────────────────────
@@ -364,17 +421,20 @@ function registerHandlers(io, socket) {
   // as long as the call does. Same "find the other party's socket and
   // forward" pattern as the ICE/offer/answer relays above.
   socket.on("call:draw:point", ({ to, strokeId, x, y, color, width }) => {
+    if (!hasActiveCall(socket.userId, to)) return;
     const recipientSocket = findSocketByUserId(io, to);
     console.log(`[call:draw] ${socket.userId} -> ${to} | strokeId=${strokeId} | recipient socket found: ${!!recipientSocket}`);
     recipientSocket?.emit("call:draw:point", { from: socket.userId, strokeId, x, y, color, width });
   });
 
   socket.on("call:draw:end", ({ to, strokeId }) => {
+    if (!hasActiveCall(socket.userId, to)) return;
     const recipientSocket = findSocketByUserId(io, to);
     recipientSocket?.emit("call:draw:end", { from: socket.userId, strokeId });
   });
 
   socket.on("call:draw:clear", ({ to }) => {
+    if (!hasActiveCall(socket.userId, to)) return;
     const recipientSocket = findSocketByUserId(io, to);
     recipientSocket?.emit("call:draw:clear", { from: socket.userId });
   });
@@ -385,16 +445,19 @@ function registerHandlers(io, socket) {
   // or enforce any consent state itself — it's just carrying messages
   // between the two clients, who each manage their own local decision.
   socket.on("call:screenshot:request", ({ to }) => {
+    if (!hasActiveCall(socket.userId, to)) return;
     const recipientSocket = findSocketByUserId(io, to);
     recipientSocket?.emit("call:screenshot:request", { from: socket.userId });
   });
 
   socket.on("call:screenshot:response", ({ to, approved }) => {
+    if (!hasActiveCall(socket.userId, to)) return;
     const recipientSocket = findSocketByUserId(io, to);
     recipientSocket?.emit("call:screenshot:response", { from: socket.userId, approved });
   });
 
   socket.on("call:screenshot:relock", ({ to }) => {
+    if (!hasActiveCall(socket.userId, to)) return;
     const recipientSocket = findSocketByUserId(io, to);
     recipientSocket?.emit("call:screenshot:relock", { from: socket.userId });
   });

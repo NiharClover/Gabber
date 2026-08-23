@@ -78,6 +78,19 @@ router.get("/search", async (req, res) => {
 router.get("/:chatId/messages", async (req, res) => {
   try {
     const { chatId } = req.params;
+
+    // SECURITY FIX: this previously returned every message in a chat with
+    // no check that the caller actually belongs to it — any authenticated
+    // user could read any conversation's full history just by knowing (or
+    // guessing/enumerating) its chatId. Membership must be verified first.
+    const membership = await pool.query(
+      "SELECT 1 FROM chat_members WHERE chat_id = $1 AND user_id = $2",
+      [chatId, req.user.userId]
+    );
+    if (!membership.rows[0]) {
+      return res.status(403).json({ error: "Not a member of this chat." });
+    }
+
     const result = await pool.query(
       `SELECT m.*, u.username AS sender_name
        FROM messages m
@@ -99,6 +112,17 @@ router.get("/:chatId/messages", async (req, res) => {
 // Mark all unread messages in a chat as read (called when user opens a chat)
 router.post("/:chatId/read", async (req, res) => {
   try {
+    // SECURITY FIX: same membership gap as GET /:chatId/messages above —
+    // previously anyone could mark any chat's messages as read, with no
+    // check they're actually part of that chat.
+    const membership = await pool.query(
+      "SELECT 1 FROM chat_members WHERE chat_id = $1 AND user_id = $2",
+      [req.params.chatId, req.user.userId]
+    );
+    if (!membership.rows[0]) {
+      return res.status(403).json({ error: "Not a member of this chat." });
+    }
+
     await pool.query(
       `UPDATE messages SET status = 'read'
        WHERE chat_id = $1 
