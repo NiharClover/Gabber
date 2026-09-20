@@ -55,6 +55,7 @@ router.post("/businesses/:id/verify", async (req, res) => {
     const result = await pool.query(
       `UPDATE businesses
        SET verification_status = $1,
+           verified = CASE WHEN $1 = 'verified' THEN TRUE ELSE FALSE END,
            verified_at = CASE WHEN $1 = 'verified' THEN NOW() ELSE verified_at END,
            verified_by = $2,
            rejection_reason = CASE WHEN $1 = 'rejected' THEN $3 ELSE NULL END,

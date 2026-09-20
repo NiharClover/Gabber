@@ -22,6 +22,8 @@ const profileRouter = require("./routes/profile");
 const businessRouter = require("./routes/business");
 const ordersRouter = require("./routes/orders");
 const adsRouter = require("./routes/ads");
+const discoveryRouter = require("./routes/discovery");
+const bookingsRouter = require("./routes/bookings");
 const { registerHandlers } = require("./socket/handlers");
 const { verifySocketToken } = require("./middleware/auth");
 const { startCleanupScheduler } = require("./services/cleanup");
@@ -30,6 +32,7 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
 });
+app.set("io", io);
 const blocksRouter = require("./routes/blocks");
 const safetyRouter = require("./routes/safety");
 const adminRouter = require("./routes/admin");
@@ -95,6 +98,8 @@ if (BUSINESS_ENABLED) {
   app.use("/api/business", businessRouter);
   app.use("/api/orders", ordersRouter);
   app.use("/api/ads", adsRouter);
+  app.use("/api/discovery", discoveryRouter);
+  app.use("/api/bookings", bookingsRouter);
 } else {
   console.log("[server] Business features disabled (FEATURE_BUSINESS_ENABLED=false)");
 }

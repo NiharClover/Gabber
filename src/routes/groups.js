@@ -6,6 +6,7 @@ const multer = require("multer");
 const path = require("path");
 const sharp = require("sharp");
 const { uploadBuffer } = require("../services/storage");
+const { normalizeGroupCreationInput } = require("../utils/groupValidation");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -24,20 +25,60 @@ const groupAvatarUpload = multer({
 
 // POST /api/groups — create group
 router.post("/", async (req, res) => {
-  const { name, memberIds } = req.body;
-  if (!name || !memberIds?.length) return res.status(400).json({ error: "name and memberIds required." });
+  const input = normalizeGroupCreationInput(req.body);
+  if (!input.ok) return res.status(400).json({ error: input.error });
+
+  let client;
   try {
+    client = await pool.connect();
+    let resolvedMemberIds = input.memberIds;
+    if (input.memberPhones.length > 0) {
+      const users = await client.query(
+        "SELECT id, phone FROM users WHERE phone::text = ANY($1::text[])",
+        [input.memberPhones]
+      );
+      const idsByPhone = new Map(users.rows.map((user) => [user.phone, user.id]));
+      const missingPhones = input.memberPhones.filter((phone) => !idsByPhone.has(phone));
+      if (missingPhones.length > 0) {
+        return res.status(400).json({
+          error: `No Gabber account found for ${missingPhones.join(", ")}.`,
+        });
+      }
+      resolvedMemberIds = [...resolvedMemberIds, ...users.rows.map((user) => user.id)];
+    }
+
+    const uniqueMemberIds = [...new Set(resolvedMemberIds)]
+      .filter((userId) => userId !== req.user.userId);
+    if (uniqueMemberIds.length === 0) {
+      return res.status(400).json({ error: "Add at least one other Gabber user." });
+    }
+
+    const existingUsers = await client.query(
+      "SELECT id FROM users WHERE id::text = ANY($1::text[])",
+      [uniqueMemberIds]
+    );
+    const existingIds = new Set(existingUsers.rows.map((user) => user.id));
+    const missingIds = uniqueMemberIds.filter((userId) => !existingIds.has(userId));
+    if (missingIds.length > 0) {
+      return res.status(400).json({ error: "One or more selected members no longer exist." });
+    }
+
     const chatId = `chat_${randomUUID().split("-")[0]}`;
-    await pool.query("INSERT INTO chats (id, type, name) VALUES ($1, 'group', $2)", [chatId, name]);
-    const allMembers = [req.user.userId, ...memberIds.filter(id => id !== req.user.userId)];
+    await client.query("BEGIN");
+    await client.query("INSERT INTO chats (id, type, name) VALUES ($1, 'group', $2)", [chatId, input.name]);
+    const allMembers = [req.user.userId, ...uniqueMemberIds];
     for (const userId of allMembers) {
       const role = userId === req.user.userId ? "admin" : "member";
-      await pool.query("INSERT INTO chat_members (chat_id, user_id, role) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", [chatId, userId, role]);
+      await client.query("INSERT INTO chat_members (chat_id, user_id, role) VALUES ($1,$2,$3)", [chatId, userId, role]);
     }
-    res.json({ success: true, chatId, name });
+    await client.query("COMMIT");
+    res.status(201).json({ success: true, chatId, name: input.name });
   } catch (err) {
+    await client?.query("ROLLBACK").catch(() => {});
     console.error("[groups]", err.message);
     res.status(500).json({ error: "Server error." });
+  } finally {
+    client?.release();
   }
 });
 

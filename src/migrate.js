@@ -2,6 +2,7 @@ require("dotenv").config();
 const { Client } = require("pg");
 const fs = require("fs");
 const path = require("path");
+const { createHash } = require("crypto");
 
 async function migrate() {
   // First connect to default 'postgres' db to create our db if needed
@@ -22,7 +23,8 @@ async function migrate() {
   );
 
   if (exists.rows.length === 0) {
-    await client.query(`CREATE DATABASE ${process.env.DB_NAME}`);
+    if (!/^[a-zA-Z0-9_]+$/.test(process.env.DB_NAME || "")) throw new Error("DB_NAME contains unsupported characters.");
+    await client.query(`CREATE DATABASE "${process.env.DB_NAME}"`);
     console.log(`[migrate] Database '${process.env.DB_NAME}' created`);
   } else {
     console.log(`[migrate] Database '${process.env.DB_NAME}' already exists`);
@@ -48,9 +50,15 @@ async function migrate() {
   await appClient.query(schema);
   console.log("[migrate] Base schema applied successfully");
 
-  // Apply any incremental migrations in order (e.g. business verification
-  // columns). Each file must be idempotent (IF NOT EXISTS / DO blocks) since
-  // the whole folder re-runs every time migrate.js is invoked.
+  await appClient.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
+    filename TEXT PRIMARY KEY,
+    checksum TEXT NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+
+  // Each incremental migration is recorded with a checksum and applied in
+  // its own transaction. Existing installations safely run the historical
+  // idempotent migrations once to seed this ledger; later runs skip them.
   const migrationsDir = path.join(__dirname, "migrations");
   if (fs.existsSync(migrationsDir)) {
     const files = fs.readdirSync(migrationsDir)
@@ -58,8 +66,23 @@ async function migrate() {
       .sort();
     for (const file of files) {
       const sql = fs.readFileSync(path.join(migrationsDir, file), "utf8");
-      await appClient.query(sql);
-      console.log(`[migrate] Applied ${file}`);
+      const checksum = createHash("sha256").update(sql).digest("hex");
+      const applied = await appClient.query("SELECT checksum FROM schema_migrations WHERE filename=$1", [file]);
+      if (applied.rows[0]) {
+        if (applied.rows[0].checksum !== checksum) throw new Error(`Applied migration ${file} has been modified.`);
+        console.log(`[migrate] Skipped ${file}`);
+        continue;
+      }
+      await appClient.query("BEGIN");
+      try {
+        await appClient.query(sql);
+        await appClient.query("INSERT INTO schema_migrations (filename,checksum) VALUES ($1,$2)", [file, checksum]);
+        await appClient.query("COMMIT");
+        console.log(`[migrate] Applied ${file}`);
+      } catch (err) {
+        await appClient.query("ROLLBACK");
+        throw err;
+      }
     }
   }
 

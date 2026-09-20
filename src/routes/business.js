@@ -6,10 +6,40 @@ const multer = require("multer");
 const path = require("path");
 const sharp = require("sharp");
 const { isValidGSTIN } = require("../utils/gstin");
-const { uploadPrivateBuffer } = require("../services/storage");
+const { uploadBuffer, uploadPrivateBuffer } = require("../services/storage");
+const { normalizeBusinessDetails, normalizeMenuItem } = require("../utils/businessValidation");
 
 const router = express.Router();
 router.use(requireAuth);
+
+// Never return raw business rows from customer-facing endpoints. In
+// particular, verification_docs contains private storage keys and
+// verified_by/rejection_reason are review metadata.
+const PUBLIC_BUSINESS_FIELDS = `
+  id, user_id, name, type, phone, address, city, pincode, lat, lng,
+  verification_status, created_at
+`;
+const OWNER_BUSINESS_FIELDS = `
+  id, user_id, name, type, phone, address, city, pincode, lat, lng,
+  gst_number, verification_status, gstin_verified, gstin_legal_name,
+  verified_at, rejection_reason, plan, created_at
+`;
+
+function withCapabilities(business, isOwner = false) {
+  if (!business) return null;
+  const verified = business.verification_status === "verified";
+  return {
+    ...business,
+    capabilities: {
+      isPublic: verified,
+      canAcceptOrders: verified,
+      canAcceptBookings: verified && ["service", "hotel"].includes(business.type),
+      canRunAds: verified,
+      canManageCatalogue: isOwner,
+      canRequestVerification: isOwner && ["unverified", "rejected"].includes(business.verification_status),
+    },
+  };
+}
 
 // SECURITY FIX: verification documents are government-ID-adjacent material
 // (GST certificates, PAN cards, address proof). This used to write them
@@ -29,10 +59,22 @@ const verifyUpload = multer({
   },
 });
 
+const menuImageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = ["image/jpeg", "image/png", "image/webp"];
+    if (allowed.includes(file.mimetype)) cb(null, true);
+    else cb(new Error("Only JPEG, PNG, or WEBP images are allowed."));
+  },
+});
+
 // POST /api/business/register
 router.post("/register", async (req, res) => {
-  const { name, type, phone, address, city, pincode, lat, lng, gstNumber } = req.body;
-  if (!name) return res.status(400).json({ error: "Business name required." });
+  const normalized = normalizeBusinessDetails(req.body);
+  if (!normalized.ok) return res.status(400).json({ error: normalized.error });
+  const { name, type, phone, address, city, pincode, lat, lng, gstNumber } = normalized.value;
+  if (gstNumber && !isValidGSTIN(gstNumber)) return res.status(400).json({ error: "Invalid GSTIN." });
   try {
     // Check if user already has a business
     const existing = await pool.query("SELECT id FROM businesses WHERE user_id = $1", [req.user.userId]);
@@ -42,12 +84,14 @@ router.post("/register", async (req, res) => {
     const id = `biz_${randomUUID().split("-")[0]}`;
     const result = await pool.query(
       `INSERT INTO businesses (id, user_id, name, type, phone, address, city, pincode, lat, lng, gst_number)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       RETURNING ${OWNER_BUSINESS_FIELDS}`,
       [id, req.user.userId, name, type || "general", phone, address, city, pincode, lat, lng, gstNumber]
     );
-    res.json({ success: true, business: result.rows[0] });
+    res.status(201).json({ success: true, business: withCapabilities(result.rows[0], true) });
   } catch (err) {
     console.error("[business]", err.message);
+    if (err.code === "23505") return res.status(409).json({ error: "You already have a registered business." });
     res.status(500).json({ error: "Server error." });
   }
 });
@@ -55,9 +99,70 @@ router.post("/register", async (req, res) => {
 // GET /api/business/mine
 router.get("/mine", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM businesses WHERE user_id = $1", [req.user.userId]);
-    res.json({ business: result.rows[0] || null });
+    const result = await pool.query(
+      `SELECT ${OWNER_BUSINESS_FIELDS} FROM businesses WHERE user_id = $1`,
+      [req.user.userId]
+    );
+    res.json({ business: withCapabilities(result.rows[0], true) });
   } catch (err) {
+    res.status(500).json({ error: "Server error." });
+  }
+});
+
+// PATCH /api/business/:id - update an owned business. Identity/location
+// changes invalidate an existing review so verification remains meaningful.
+router.patch("/:id", async (req, res) => {
+  try {
+    const currentResult = await pool.query(
+      `SELECT ${OWNER_BUSINESS_FIELDS} FROM businesses WHERE id=$1 AND user_id=$2`,
+      [req.params.id, req.user.userId]
+    );
+    const current = currentResult.rows[0];
+    if (!current) return res.status(404).json({ error: "Business not found." });
+
+    const normalized = normalizeBusinessDetails({
+      name: req.body.name ?? current.name,
+      type: req.body.type ?? current.type,
+      phone: req.body.phone ?? current.phone,
+      address: req.body.address ?? current.address,
+      city: req.body.city ?? current.city,
+      pincode: req.body.pincode ?? current.pincode,
+      lat: req.body.lat ?? current.lat,
+      lng: req.body.lng ?? current.lng,
+      gstNumber: req.body.gstNumber ?? current.gst_number,
+    });
+    if (!normalized.ok) return res.status(400).json({ error: normalized.error });
+    const value = normalized.value;
+    if (value.gstNumber && !isValidGSTIN(value.gstNumber)) return res.status(400).json({ error: "Invalid GSTIN." });
+
+    const identityChanged = ["name", "type", "phone", "address", "city", "pincode", "lat", "lng"]
+      .some((field) => String(value[field] ?? "") !== String(current[field] ?? ""))
+      || String(value.gstNumber ?? "") !== String(current.gst_number ?? "");
+    const resetVerification = identityChanged && current.verification_status !== "unverified";
+
+    const result = await pool.query(
+      `UPDATE businesses
+       SET name=$1, type=$2, phone=$3, address=$4, city=$5, pincode=$6,
+           lat=$7, lng=$8, gst_number=$9,
+           verification_status=CASE WHEN $10 THEN 'unverified' ELSE verification_status END,
+           verification_docs=CASE WHEN $10 THEN '[]'::jsonb ELSE verification_docs END,
+           gstin_verified=CASE WHEN $10 THEN FALSE ELSE gstin_verified END,
+           gstin_legal_name=CASE WHEN $10 THEN NULL ELSE gstin_legal_name END,
+           verified_at=CASE WHEN $10 THEN NULL ELSE verified_at END,
+           verified_by=CASE WHEN $10 THEN NULL ELSE verified_by END,
+           rejection_reason=CASE WHEN $10 THEN NULL ELSE rejection_reason END
+       WHERE id=$11 AND user_id=$12
+       RETURNING ${OWNER_BUSINESS_FIELDS}`,
+      [value.name, value.type, value.phone, value.address, value.city, value.pincode,
+        value.lat, value.lng, value.gstNumber, resetVerification, req.params.id, req.user.userId]
+    );
+    res.json({
+      success: true,
+      reverificationRequired: resetVerification,
+      business: withCapabilities(result.rows[0], true),
+    });
+  } catch (err) {
+    console.error("[business update]", err.message);
     res.status(500).json({ error: "Server error." });
   }
 });
@@ -65,13 +170,22 @@ router.get("/mine", async (req, res) => {
 // GET /api/business/:id
 router.get("/:id", async (req, res) => {
   try {
-    const biz = await pool.query("SELECT * FROM businesses WHERE id = $1", [req.params.id]);
-    if (!biz.rows[0]) return res.status(404).json({ error: "Not found." });
-    const menu = await pool.query(
-      "SELECT * FROM menu_items WHERE business_id = $1 AND available = true ORDER BY category, name",
+    const biz = await pool.query(
+      `SELECT ${PUBLIC_BUSINESS_FIELDS} FROM businesses WHERE id = $1`,
       [req.params.id]
     );
-    res.json({ business: biz.rows[0], menu: menu.rows });
+    if (!biz.rows[0]) return res.status(404).json({ error: "Not found." });
+    const isOwner = biz.rows[0].user_id === req.user.userId;
+    if (!isOwner && biz.rows[0].verification_status !== "verified") {
+      return res.status(404).json({ error: "Business not found." });
+    }
+    const menu = await pool.query(
+      `SELECT id, business_id, name, description, price, category, available, image_url, created_at, updated_at
+       FROM menu_items WHERE business_id = $1 AND ($2::boolean OR available = TRUE)
+       ORDER BY category, name`,
+      [req.params.id, isOwner]
+    );
+    res.json({ business: withCapabilities(biz.rows[0], isOwner), menu: menu.rows });
   } catch (err) {
     res.status(500).json({ error: "Server error." });
   }
@@ -79,19 +193,99 @@ router.get("/:id", async (req, res) => {
 
 // POST /api/business/menu
 router.post("/menu", async (req, res) => {
-  const { name, description, price, category } = req.body;
-  if (!name || !price) return res.status(400).json({ error: "name and price required." });
+  const normalized = normalizeMenuItem(req.body);
+  if (!normalized.ok) return res.status(400).json({ error: normalized.error });
+  const { name, description, price, category, available } = normalized.value;
   try {
     const biz = await pool.query("SELECT id FROM businesses WHERE user_id = $1", [req.user.userId]);
     if (!biz.rows[0]) return res.status(404).json({ error: "No business found." });
     const id = `item_${randomUUID().split("-")[0]}`;
     const result = await pool.query(
-      `INSERT INTO menu_items (id, business_id, name, description, price, category)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [id, biz.rows[0].id, name, description, price, category || "General"]
+      `INSERT INTO menu_items (id, business_id, name, description, price, category, available)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [id, biz.rows[0].id, name, description, price, category, available]
+    );
+    res.status(201).json({ success: true, item: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: "Server error." });
+  }
+});
+
+// GET /api/business/menu/mine - includes unavailable items for management.
+router.get("/menu/mine", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT mi.id, mi.business_id, mi.name, mi.description, mi.price, mi.category,
+              mi.available, mi.image_url, mi.created_at, mi.updated_at
+       FROM menu_items mi JOIN businesses b ON b.id=mi.business_id
+       WHERE b.user_id=$1 ORDER BY mi.category, mi.name`,
+      [req.user.userId]
+    );
+    res.json({ items: result.rows });
+  } catch (err) {
+    console.error("[business menu mine]", err.message);
+    res.status(500).json({ error: "Server error." });
+  }
+});
+
+router.patch("/menu/:id", async (req, res) => {
+  try {
+    const currentResult = await pool.query(
+      `SELECT mi.* FROM menu_items mi JOIN businesses b ON b.id=mi.business_id
+       WHERE mi.id=$1 AND b.user_id=$2`,
+      [req.params.id, req.user.userId]
+    );
+    const current = currentResult.rows[0];
+    if (!current) return res.status(404).json({ error: "Menu item not found." });
+    const normalized = normalizeMenuItem({
+      name: req.body.name ?? current.name,
+      description: req.body.description ?? current.description,
+      price: req.body.price ?? current.price,
+      category: req.body.category ?? current.category,
+      available: req.body.available ?? current.available,
+    });
+    if (!normalized.ok) return res.status(400).json({ error: normalized.error });
+    const value = normalized.value;
+    const result = await pool.query(
+      `UPDATE menu_items SET name=$1, description=$2, price=$3, category=$4,
+              available=$5, updated_at=NOW()
+       WHERE id=$6 RETURNING *`,
+      [value.name, value.description, value.price, value.category, value.available, req.params.id]
     );
     res.json({ success: true, item: result.rows[0] });
   } catch (err) {
+    console.error("[business menu update]", err.message);
+    res.status(500).json({ error: "Server error." });
+  }
+});
+
+router.post("/menu/:id/image", menuImageUpload.single("image"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "Image required." });
+  try {
+    const owned = await pool.query(
+      `SELECT mi.id FROM menu_items mi JOIN businesses b ON b.id=mi.business_id
+       WHERE mi.id=$1 AND b.user_id=$2`,
+      [req.params.id, req.user.userId]
+    );
+    if (!owned.rows[0]) return res.status(404).json({ error: "Menu item not found." });
+    let image;
+    try {
+      image = await sharp(req.file.buffer)
+        .resize({ width: 1200, height: 1200, fit: "inside", withoutEnlargement: true })
+        .jpeg({ quality: 85 })
+        .toBuffer();
+    } catch {
+      return res.status(400).json({ error: "That does not look like a valid image." });
+    }
+    const filename = `menu_${req.params.id}_${randomUUID()}.jpg`;
+    const imageUrl = await uploadBuffer(image, "menu", filename, "image/jpeg", req);
+    const result = await pool.query(
+      "UPDATE menu_items SET image_url=$1, updated_at=NOW() WHERE id=$2 RETURNING *",
+      [imageUrl, req.params.id]
+    );
+    res.json({ success: true, item: result.rows[0] });
+  } catch (err) {
+    console.error("[business menu image]", err.message);
     res.status(500).json({ error: "Server error." });
   }
 });
@@ -125,8 +319,12 @@ router.delete("/menu/:id", async (req, res) => {
 // GET /api/business/by-user/:userId
 router.get("/by-user/:userId", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM businesses WHERE user_id = $1", [req.params.userId]);
-    res.json({ business: result.rows[0] || null });
+    const result = await pool.query(
+      `SELECT ${PUBLIC_BUSINESS_FIELDS} FROM businesses
+       WHERE user_id = $1 AND (verification_status='verified' OR user_id=$2)`,
+      [req.params.userId, req.user.userId]
+    );
+    res.json({ business: withCapabilities(result.rows[0], result.rows[0]?.user_id === req.user.userId) });
   } catch (err) {
     res.status(500).json({ error: "Server error." });
   }
