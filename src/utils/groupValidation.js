@@ -13,6 +13,9 @@ function normalizeGroupCreationInput(body = {}) {
   if (memberPhones.length === 0 && memberIds.length === 0) {
     return { ok: false, error: "Add at least one member." };
   }
+  if (memberPhones.length + memberIds.length > 256) {
+    return { ok: false, error: "A group can have at most 256 selected members." };
+  }
   if (memberPhones.some((phone) => !/^\+[1-9]\d{9,14}$/.test(phone))) {
     return { ok: false, error: "Member phone numbers must use international format, for example +919876543210." };
   }

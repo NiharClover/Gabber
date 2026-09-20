@@ -62,6 +62,13 @@ router.post("/", async (req, res) => {
     if (missingIds.length > 0) {
       return res.status(400).json({ error: "One or more selected members no longer exist." });
     }
+    const blocked = await client.query(
+      `SELECT 1 FROM blocked_users
+       WHERE (blocker_id=$1 AND blocked_id=ANY($2::varchar[]))
+          OR (blocked_id=$1 AND blocker_id=ANY($2::varchar[])) LIMIT 1`,
+      [req.user.userId, uniqueMemberIds]
+    );
+    if (blocked.rows[0]) return res.status(403).json({ error: "One or more selected users cannot be added." });
 
     const chatId = `chat_${randomUUID().split("-")[0]}`;
     await client.query("BEGIN");
@@ -171,12 +178,21 @@ router.post("/:chatId/avatar", groupAvatarUpload.single("avatar"), async (req, r
 // POST /api/groups/:chatId/members — add member (admin only)
 router.post("/:chatId/members", async (req, res) => {
   const { userId } = req.body;
+  if (typeof userId !== "string" || !userId) return res.status(400).json({ error: "userId is required." });
   try {
     const adminCheck = await pool.query(
       "SELECT role FROM chat_members WHERE chat_id = $1 AND user_id = $2",
       [req.params.chatId, req.user.userId]
     );
     if (adminCheck.rows[0]?.role !== "admin") return res.status(403).json({ error: "Admin only." });
+    if (userId === req.user.userId) return res.status(400).json({ error: "You are already a member." });
+    const candidate = await pool.query("SELECT id FROM users WHERE id=$1", [userId]);
+    if (!candidate.rows[0]) return res.status(404).json({ error: "User not found." });
+    const blocked = await pool.query(
+      `SELECT 1 FROM blocked_users WHERE (blocker_id=$1 AND blocked_id=$2) OR (blocker_id=$2 AND blocked_id=$1)`,
+      [req.user.userId, userId]
+    );
+    if (blocked.rows[0]) return res.status(403).json({ error: "This user cannot be added." });
     await pool.query(
       "INSERT INTO chat_members (chat_id, user_id, role) VALUES ($1,$2,'member') ON CONFLICT DO NOTHING",
       [req.params.chatId, userId]

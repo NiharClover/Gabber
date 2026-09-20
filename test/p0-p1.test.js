@@ -44,6 +44,12 @@ test("group creation accepts the memberPhones contract used by the app", () => {
   });
 });
 
+test("group creation accepts contact-picker user IDs", () => {
+  assert.deepEqual(normalizeGroupCreationInput({ name: "Team", memberIds: ["user_1", "user_2", "user_1"] }), {
+    ok: true, name: "Team", memberPhones: [], memberIds: ["user_1", "user_2"],
+  });
+});
+
 test("group creation rejects empty or malformed member lists", () => {
   assert.equal(normalizeGroupCreationInput({ name: "Friends", memberPhones: [] }).ok, false);
   assert.equal(normalizeGroupCreationInput({ name: "Friends", memberPhones: ["9876543210"] }).ok, false);

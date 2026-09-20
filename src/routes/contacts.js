@@ -23,6 +23,27 @@ const contactsSyncLimiter = rateLimit({
   message: { error: "Too many contact syncs. Try again in a few minutes." },
 });
 
+// People the caller already has a direct Gabber conversation with. This
+// remains useful when device-contact permission is denied or a number is not
+// saved locally.
+router.get("/gabber", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT DISTINCT u.id,u.username,u.phone,u.avatar_url,u.last_seen
+       FROM chats c
+       JOIN chat_members mine ON mine.chat_id=c.id AND mine.user_id=$1
+       JOIN chat_members other ON other.chat_id=c.id AND other.user_id!=$1
+       JOIN users u ON u.id=other.user_id
+       WHERE c.type='direct' ORDER BY u.username`,
+      [req.user.userId]
+    );
+    res.json({ contacts: result.rows });
+  } catch (err) {
+    console.error("[gabber contacts]", err.message);
+    res.status(500).json({ error: "Server error." });
+  }
+});
+
 // POST /api/contacts/sync
 // Body: { phones: ["+919876543210", "+911234567890", ...] }
 // Returns which of these numbers are registered on Gabber
