@@ -34,7 +34,13 @@ router.get("/gabber", async (req, res) => {
        JOIN chat_members mine ON mine.chat_id=c.id AND mine.user_id=$1
        JOIN chat_members other ON other.chat_id=c.id AND other.user_id!=$1
        JOIN users u ON u.id=other.user_id
-       WHERE c.type='direct' ORDER BY u.username`,
+       WHERE c.type='direct'
+         AND NOT EXISTS (
+           SELECT 1 FROM blocked_users bu
+           WHERE (bu.blocker_id=$1 AND bu.blocked_id=u.id)
+              OR (bu.blocker_id=u.id AND bu.blocked_id=$1)
+         )
+       ORDER BY u.username`,
       [req.user.userId]
     );
     res.json({ contacts: result.rows });
@@ -60,10 +66,12 @@ router.post("/sync", contactsSyncLimiter, async (req, res) => {
   try {
     // Normalize all numbers — strip spaces, dashes etc
     const normalized = phones
-      .map((p) => p.replace(/[\s\-().]/g, ""))
-      .filter((p) => p.startsWith("+") && p.length >= 10);
+      .filter((phone) => typeof phone === "string")
+      .map((phone) => phone.replace(/[\s\-().]/g, ""))
+      .filter((phone) => /^\+[1-9]\d{9,14}$/.test(phone));
+    const uniquePhones = [...new Set(normalized)];
 
-    if (normalized.length === 0) {
+    if (uniquePhones.length === 0) {
       return res.json({ contacts: [] });
     }
 
@@ -71,8 +79,13 @@ router.post("/sync", contactsSyncLimiter, async (req, res) => {
     const result = await pool.query(
       `SELECT id, username, phone, avatar_url, last_seen
        FROM users
-       WHERE phone = ANY($1) AND id != $2`,
-      [normalized, req.user.userId]
+       WHERE phone = ANY($1) AND id != $2
+         AND NOT EXISTS (
+           SELECT 1 FROM blocked_users bu
+           WHERE (bu.blocker_id=$2 AND bu.blocked_id=users.id)
+              OR (bu.blocker_id=users.id AND bu.blocked_id=$2)
+         )`,
+      [uniquePhones, req.user.userId]
     );
 
     res.json({ contacts: result.rows });

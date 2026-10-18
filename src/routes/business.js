@@ -8,6 +8,8 @@ const sharp = require("sharp");
 const { isValidGSTIN } = require("../utils/gstin");
 const { uploadBuffer, uploadPrivateBuffer } = require("../services/storage");
 const { normalizeBusinessDetails, normalizeMenuItem } = require("../utils/businessValidation");
+const { verifyGstin } = require("../services/cashfreeGstin");
+const { rateLimit } = require("express-rate-limit");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -22,6 +24,8 @@ const PUBLIC_BUSINESS_FIELDS = `
 const OWNER_BUSINESS_FIELDS = `
   id, user_id, name, type, phone, address, city, pincode, lat, lng,
   gst_number, verification_status, gstin_verified, gstin_legal_name,
+  gstin_trade_name, gstin_registry_status, gstin_reference_id,
+  gstin_registration_date, gstin_name_match, gstin_checked_at, gstin_provider,
   verified_at, rejection_reason, plan, created_at
 `;
 
@@ -67,6 +71,13 @@ const menuImageUpload = multer({
     if (allowed.includes(file.mimetype)) cb(null, true);
     else cb(new Error("Only JPEG, PNG, or WEBP images are allowed."));
   },
+});
+
+const gstinVerificationLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  keyGenerator: (req) => req.user.userId,
+  message: { error: "Too many GSTIN verification attempts. Try again later." },
 });
 
 // POST /api/business/register
@@ -148,6 +159,13 @@ router.patch("/:id", async (req, res) => {
            verification_docs=CASE WHEN $10 THEN '[]'::jsonb ELSE verification_docs END,
            gstin_verified=CASE WHEN $10 THEN FALSE ELSE gstin_verified END,
            gstin_legal_name=CASE WHEN $10 THEN NULL ELSE gstin_legal_name END,
+           gstin_trade_name=CASE WHEN $10 THEN NULL ELSE gstin_trade_name END,
+           gstin_registry_status=CASE WHEN $10 THEN NULL ELSE gstin_registry_status END,
+           gstin_reference_id=CASE WHEN $10 THEN NULL ELSE gstin_reference_id END,
+           gstin_registration_date=CASE WHEN $10 THEN NULL ELSE gstin_registration_date END,
+           gstin_name_match=CASE WHEN $10 THEN NULL ELSE gstin_name_match END,
+           gstin_checked_at=CASE WHEN $10 THEN NULL ELSE gstin_checked_at END,
+           gstin_provider=CASE WHEN $10 THEN NULL ELSE gstin_provider END,
            verified_at=CASE WHEN $10 THEN NULL ELSE verified_at END,
            verified_by=CASE WHEN $10 THEN NULL ELSE verified_by END,
            rejection_reason=CASE WHEN $10 THEN NULL ELSE rejection_reason END
@@ -340,6 +358,7 @@ router.get("/by-user/:userId", async (req, res) => {
 // see the acceptance criteria in the verification system spec.
 router.post(
   "/:id/verify-request",
+  gstinVerificationLimiter,
   verifyUpload.fields([
     { name: "gst_certificate", maxCount: 1 },
     { name: "address_proof", maxCount: 1 },
@@ -354,10 +373,13 @@ router.post(
     if (!gstin || !isValidGSTIN(gstin)) {
       return res.status(400).json({ error: "Invalid GSTIN format or checksum. Double-check and try again." });
     }
+    if (!["gst_certificate", "address_proof", "pan"].some((field) => req.files?.[field]?.[0])) {
+      return res.status(400).json({ error: "At least one supporting document is required." });
+    }
 
     try {
       const biz = await pool.query(
-        "SELECT id, user_id, verification_status FROM businesses WHERE id = $1",
+        "SELECT id, user_id, name, verification_status FROM businesses WHERE id = $1",
         [req.params.id]
       );
       if (!biz.rows[0]) return res.status(404).json({ error: "Business not found." });
@@ -366,6 +388,28 @@ router.post(
       }
       if (biz.rows[0].verification_status === "verified") {
         return res.status(400).json({ error: "This business is already verified." });
+      }
+      if (biz.rows[0].verification_status === "pending") {
+        return res.status(409).json({ error: "This business already has a verification under review." });
+      }
+
+      let gstinCheck;
+      try {
+        gstinCheck = await verifyGstin({
+          gstin: gstin.trim().toUpperCase(),
+          businessName: biz.rows[0].name,
+        });
+      } catch (verificationError) {
+        return res.status(verificationError.status || 503).json({
+          error: verificationError.message,
+          code: verificationError.code || "GSTIN_SERVICE_UNAVAILABLE",
+        });
+      }
+      if (!gstinCheck.valid) {
+        return res.status(400).json({ error: "This GSTIN was not found in the GST registry." });
+      }
+      if (!gstinCheck.active) {
+        return res.status(400).json({ error: `This GSTIN is ${gstinCheck.registryStatus || "not active"} and cannot be verified.` });
       }
 
       const docs = [];
@@ -404,11 +448,29 @@ router.post(
          SET gst_number = $1,
              verification_status = 'pending',
              verification_docs = $2,
+             gstin_verified = TRUE,
+             gstin_legal_name = $3,
+             gstin_trade_name = $4,
+             gstin_registry_status = $5,
+             gstin_reference_id = $6,
+             gstin_registration_date = $7,
+             gstin_name_match = $8,
+             gstin_checked_at = NOW(),
+             gstin_provider = 'cashfree',
              rejection_reason = NULL
-         WHERE id = $3
-         RETURNING id, verification_status`,
-        [gstin.toUpperCase(), JSON.stringify(docs), req.params.id]
+         WHERE id = $9 AND verification_status IN ('unverified','rejected')
+         RETURNING id, verification_status, gstin_verified, gstin_legal_name,
+                   gstin_trade_name, gstin_registry_status, gstin_name_match`,
+        [
+          gstin.toUpperCase(), JSON.stringify(docs), gstinCheck.legalName,
+          gstinCheck.tradeName, gstinCheck.registryStatus, gstinCheck.referenceId,
+          gstinCheck.registrationDate, gstinCheck.nameMatch, req.params.id,
+        ]
       );
+
+      if (!result.rows[0]) {
+        return res.status(409).json({ error: "Verification state changed. Refresh and try again." });
+      }
 
       res.json({ success: true, business: result.rows[0] });
     } catch (err) {

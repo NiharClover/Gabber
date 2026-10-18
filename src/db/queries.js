@@ -265,20 +265,20 @@ async function updateMessageStatus(messageId, status) {
 
 async function getUserDeviceTokens(userId) {
   const result = await pool.query(
-    "SELECT token FROM device_tokens WHERE user_id = $1",
+    "SELECT push_token FROM device_tokens WHERE user_id = $1 AND provider = 'expo'",
     [userId]
   );
-  return result.rows.map((r) => r.token);
+  return result.rows.map((r) => r.push_token);
 }
 
 async function getGroupMemberTokens(chatId, excludeUserId) {
   const result = await pool.query(
-    `SELECT dt.token FROM device_tokens dt
+    `SELECT dt.push_token FROM device_tokens dt
      JOIN chat_members cm ON cm.user_id = dt.user_id
-     WHERE cm.chat_id = $1 AND dt.user_id != $2`,
+     WHERE cm.chat_id = $1 AND dt.user_id != $2 AND dt.provider = 'expo'`,
     [chatId, excludeUserId]
   );
-  return result.rows.map((r) => r.token);
+  return result.rows.map((r) => r.push_token);
 }
 
 module.exports = {

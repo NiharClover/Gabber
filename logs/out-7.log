@@ -1,4 +1,0 @@
-2026-06-17 18:15:48: ◇ injected env (13) from .env // tip: ◈ secrets for agents [www.dotenvx.com]
-2026-06-17 18:16:08: [cleanup] Scheduler started — only viewed once-files will be auto-deleted
-2026-06-17 18:16:08: Gabber server running on http://localhost:3000
-2026-06-17 18:16:08: [redis] Connected

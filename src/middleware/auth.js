@@ -9,7 +9,7 @@ function requireAuth(req, res, next) {
 
   const token = header.split(" ")[1];
   try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ["HS256"] });
     next();
   } catch {
     res.status(401).json({ error: "Invalid or expired token." });
@@ -18,7 +18,7 @@ function requireAuth(req, res, next) {
 
 // Called from Socket.IO handshake
 function verifySocketToken(token) {
-  return jwt.verify(token, process.env.JWT_SECRET);
+  return jwt.verify(token, process.env.JWT_SECRET, { algorithms: ["HS256"] });
 }
 
 module.exports = { requireAuth, verifySocketToken };

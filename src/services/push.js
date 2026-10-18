@@ -3,7 +3,7 @@ const expo = new Expo();
 
 async function sendPushNotification(pushToken, data) {
   if (!Expo.isExpoPushToken(pushToken)) {
-    console.error("[push] Invalid token:", pushToken);
+    console.error("[push] Invalid Expo token rejected");
     return;
   }
 
@@ -17,8 +17,9 @@ async function sendPushNotification(pushToken, data) {
     if (text?.startsWith("[image]")) body = "📷 Sent a photo";
     else if (text?.startsWith("[view-once]")) body = "👁 Sent a view once photo";
     else if (text?.startsWith("[voice]")) body = "🎤 Sent a voice message";
-    else if (text?.startsWith("[payment]")) body = "💰 Sent a payment";
-    else if (text?.startsWith("[payment-request]")) body = "💰 Requesting a payment";
+    else if (text?.startsWith("[payment-status-v2]")) body = "Payment status updated";
+    else if (text?.startsWith("[payment-v2]") || text?.startsWith("[payment]")) body = "Payment initiated";
+    else if (text?.startsWith("[payment-request-v2]") || text?.startsWith("[payment-request]")) body = "Payment requested";
     else if (text?.startsWith("[sticker]")) body = "✨ Sent a sticker";
     else if (text?.startsWith("[bill]")) body = "🧾 Sent an order bill";
     else body = text || "New message";

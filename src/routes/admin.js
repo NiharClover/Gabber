@@ -11,8 +11,7 @@ router.use(requireAdmin);
 
 // GET /api/admin/businesses/pending
 // Manual review checklist for the reviewer (not automated):
-//   1. Cross-check the GSTIN on search.gst.gov.in — confirm active/registered,
-//      note the registered legal name.
+//   1. Confirm Cashfree returned an active GSTIN and review its reference id.
 //   2. Compare registered legal name to the entered business name — flag
 //      mismatches for follow-up, don't auto-reject (name variations happen).
 //   3. Sanity-check registered business category vs. what they're listing.
@@ -22,7 +21,11 @@ router.get("/businesses/pending", async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, user_id, name, type, phone, address, city, pincode,
-              gst_number, verification_docs, verification_status, created_at
+              gst_number, verification_docs, verification_status, created_at,
+              gstin_verified, gstin_legal_name, gstin_trade_name,
+              gstin_registry_status, gstin_reference_id,
+              gstin_registration_date, gstin_name_match, gstin_checked_at,
+              gstin_provider
        FROM businesses
        WHERE verification_status = 'pending'
        ORDER BY created_at ASC`
@@ -35,13 +38,13 @@ router.get("/businesses/pending", async (req, res) => {
 });
 
 // POST /api/admin/businesses/:id/verify
-// body: { approve: boolean, rejection_reason?: string, gstin_legal_name?: string }
+// body: { approve: boolean, rejection_reason?: string }
 //
 // This is the ONLY place verification_status can move to 'verified' or
 // 'rejected'. It intentionally has no knowledge of `plan` or payment state —
 // do not add any payment/plan check to this route.
 router.post("/businesses/:id/verify", async (req, res) => {
-  const { approve, rejection_reason, gstin_legal_name } = req.body;
+  const { approve, rejection_reason } = req.body;
 
   if (typeof approve !== "boolean") {
     return res.status(400).json({ error: "approve (boolean) is required." });
@@ -58,15 +61,29 @@ router.post("/businesses/:id/verify", async (req, res) => {
            verified = CASE WHEN $1 = 'verified' THEN TRUE ELSE FALSE END,
            verified_at = CASE WHEN $1 = 'verified' THEN NOW() ELSE verified_at END,
            verified_by = $2,
-           rejection_reason = CASE WHEN $1 = 'rejected' THEN $3 ELSE NULL END,
-           gstin_verified = CASE WHEN $1 = 'verified' THEN TRUE ELSE gstin_verified END,
-           gstin_legal_name = COALESCE($4, gstin_legal_name)
-       WHERE id = $5
+           rejection_reason = CASE WHEN $1 = 'rejected' THEN $3 ELSE NULL END
+       WHERE id = $4
+         AND verification_status = 'pending'
+         AND ($1 <> 'verified' OR (
+           gstin_verified = TRUE
+           AND LOWER(COALESCE(gstin_registry_status, '')) = 'active'
+         ))
        RETURNING id, name, verification_status, verified_at, verified_by, plan`,
-      [status, req.user.userId, rejection_reason || null, gstin_legal_name || null, req.params.id]
+      [status, req.user.userId, rejection_reason?.trim() || null, req.params.id]
     );
 
-    if (!result.rows[0]) return res.status(404).json({ error: "Business not found." });
+    if (!result.rows[0]) {
+      const existing = await pool.query(
+        "SELECT verification_status, gstin_verified, gstin_registry_status FROM businesses WHERE id=$1",
+        [req.params.id]
+      );
+      if (!existing.rows[0]) return res.status(404).json({ error: "Business not found." });
+      return res.status(409).json({
+        error: approve
+          ? "Only a pending business with an active Cashfree-verified GSTIN can be approved."
+          : "Only a pending verification can be rejected.",
+      });
+    }
 
     // Audit log — reviewer id + timestamp, per acceptance criteria.
     console.log(

@@ -48,8 +48,19 @@ router.get("/", async (req, res) => {
 router.get("/:userId", async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT id, username, phone, about, avatar_url, created_at FROM users WHERE id = $1",
-      [req.params.userId]
+      `SELECT u.id, u.username, u.phone, u.about, u.avatar_url, u.created_at
+       FROM users u WHERE u.id=$1
+         AND NOT EXISTS (
+           SELECT 1 FROM blocked_users bu
+           WHERE (bu.blocker_id=$1 AND bu.blocked_id=$2)
+              OR (bu.blocker_id=$2 AND bu.blocked_id=$1)
+         )
+         AND ($1=$2 OR EXISTS (
+           SELECT 1 FROM chat_members mine
+           JOIN chat_members peer ON peer.chat_id=mine.chat_id
+           WHERE mine.user_id=$2 AND peer.user_id=$1
+         ))`,
+      [req.params.userId, req.user.userId]
     );
     if (!result.rows[0]) return res.status(404).json({ error: "User not found." });
     res.json(result.rows[0]);
@@ -61,14 +72,28 @@ router.get("/:userId", async (req, res) => {
 // PATCH /api/profile — update name, about, email
 router.patch("/", async (req, res) => {
   const { username, about, email } = req.body;
+  const hasUsername = username !== undefined;
+  const hasAbout = about !== undefined;
+  const hasEmail = email !== undefined;
+  const nextUsername = typeof username === "string" ? username.trim() : "";
+  const nextAbout = typeof about === "string" ? about.trim() : "";
+  const nextEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
+  if (!hasUsername && !hasAbout && !hasEmail) return res.status(400).json({ error: "Nothing to update." });
+  if (hasUsername && (nextUsername.length < 2 || nextUsername.length > 50)) {
+    return res.status(400).json({ error: "Name must be between 2 and 50 characters." });
+  }
+  if (hasAbout && nextAbout.length > 200) return res.status(400).json({ error: "About must be 200 characters or fewer." });
+  if (hasEmail && nextEmail && (nextEmail.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(nextEmail))) {
+    return res.status(400).json({ error: "Enter a valid email address." });
+  }
   try {
     await pool.query(
-      `UPDATE users SET 
-        username = COALESCE($1, username),
-        about = COALESCE($2, about),
-        email = COALESCE($3, email)
-       WHERE id = $4`,
-      [username || null, about || null, email || null, req.user.userId]
+      `UPDATE users SET
+        username = CASE WHEN $1 THEN $2 ELSE username END,
+        about = CASE WHEN $3 THEN $4 ELSE about END,
+        email = CASE WHEN $5 THEN NULLIF($6, '') ELSE email END
+       WHERE id = $7`,
+      [hasUsername, nextUsername, hasAbout, nextAbout, hasEmail, nextEmail, req.user.userId]
     );
     res.json({ success: true });
   } catch (err) {

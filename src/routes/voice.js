@@ -15,7 +15,8 @@ const upload = multer({
   limits: { fileSize: 16 * 1024 * 1024 }, // 16MB max
   fileFilter: (req, file, cb) => {
     const allowed = ["audio/m4a", "audio/mp4", "audio/mpeg", "audio/wav", "audio/aac", "audio/x-m4a"];
-    if (allowed.includes(file.mimetype) || file.originalname.endsWith(".m4a")) {
+    const safeFallback = file.mimetype === "application/octet-stream" && /\.m4a$/i.test(file.originalname);
+    if (allowed.includes(file.mimetype) || safeFallback) {
       cb(null, true);
     } else {
       cb(new Error("Only audio files allowed."));
@@ -29,8 +30,10 @@ router.post("/upload", upload.single("audio"), async (req, res) => {
 
   try {
     const filename = `voice_${Date.now()}_${randomUUID().split("-")[0]}.m4a`;
-    const url = await uploadBuffer(req.file.buffer, "voice", filename, req.file.mimetype || "audio/m4a", req);
-    const duration = req.body.duration ? parseInt(req.body.duration) : 0;
+    const contentType = req.file.mimetype === "application/octet-stream" ? "audio/mp4" : req.file.mimetype;
+    const url = await uploadBuffer(req.file.buffer, "voice", filename, contentType, req);
+    const parsedDuration = Number.parseInt(req.body.duration, 10);
+    const duration = Number.isFinite(parsedDuration) ? Math.min(Math.max(parsedDuration, 0), 3600) : 0;
 
     console.log(`[voice] Uploaded: ${filename} (${duration}s) by ${req.user.username}`);
     res.json({ success: true, url, filename, duration });

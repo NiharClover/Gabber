@@ -162,6 +162,10 @@ async function uploadPrivateBuffer(buffer, subfolder, filename, contentType) {
  *   null — file not found
  */
 async function getPrivateFileAccess(key) {
+  if (typeof key !== "string" || !/^[A-Za-z0-9_-]+\/[A-Za-z0-9_.-]+$/.test(key) || key.includes("..")) {
+    console.warn("[storage] Rejected invalid private storage key");
+    return null;
+  }
   if (USE_S3 && s3Client) {
     try {
       const { GetObjectCommand } = require("@aws-sdk/client-s3");
@@ -181,7 +185,9 @@ async function getPrivateFileAccess(key) {
     }
   }
 
-  const filepath = path.join(PRIVATE_LOCAL_ROOT, key);
+  const filepath = path.resolve(PRIVATE_LOCAL_ROOT, key);
+  const privateRoot = `${path.resolve(PRIVATE_LOCAL_ROOT)}${path.sep}`;
+  if (!filepath.startsWith(privateRoot)) return null;
   if (!fs.existsSync(filepath)) return null;
   return { type: "file", path: filepath };
 }

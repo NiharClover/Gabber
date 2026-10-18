@@ -38,7 +38,7 @@ function messagePayload(msg, extras = {}) {
 async function pushToUser(userId, data) {
   try {
     const result = await pool.query(
-      "SELECT push_token FROM device_tokens WHERE user_id=$1 ORDER BY updated_at DESC",
+      "SELECT push_token FROM device_tokens WHERE user_id=$1 AND provider='expo' ORDER BY updated_at DESC",
       [userId]
     );
     await Promise.all(result.rows.map((row) => sendPushNotification(row.push_token, data)));
@@ -91,6 +91,16 @@ async function markDelivered(io, messageId, recipientIds) {
 
 async function insertMessage(client, { chatId, senderId, text, replyTo, clientMessageId, recipientIds }) {
   const messageId = `msg_${randomUUID().split("-")[0]}`;
+  let verifiedReply = null;
+  if (typeof replyTo?.id === "string" && replyTo.id.length <= 50) {
+    const replyResult = await client.query(
+      `SELECT m.id, m.text, u.username
+       FROM messages m LEFT JOIN users u ON u.id=m.sender_id
+       WHERE m.id=$1 AND m.chat_id=$2 AND m.deleted_for_everyone=FALSE`,
+      [replyTo.id, chatId]
+    );
+    verifiedReply = replyResult.rows[0] || null;
+  }
   const result = await client.query(
     `INSERT INTO messages
        (id, chat_id, sender_id, client_message_id, text, reply_to_id, reply_to_text, reply_to_sender, status)
@@ -99,7 +109,8 @@ async function insertMessage(client, { chatId, senderId, text, replyTo, clientMe
      DO UPDATE SET client_message_id=EXCLUDED.client_message_id
      RETURNING *, (xmax=0) AS inserted`,
     [messageId, chatId, senderId, clientMessageId, text.trim(),
-      replyTo?.id || null, replyTo?.text || null, replyTo?.sender || null]
+      verifiedReply?.id || null, verifiedReply?.text?.slice(0, 500) || null,
+      verifiedReply?.username || null]
   );
   const msg = result.rows[0];
   if (recipientIds.length > 0) {

@@ -25,7 +25,8 @@ router.get("/", async (req, res) => {
 router.get("/search", async (req, res) => {
   try {
     const { q } = req.query;
-    if (!q || q.trim().length < 1) return res.json({ messages: [], chats: [], groups: [] });
+    if (typeof q !== "string" || q.trim().length < 1) return res.json({ messages: [], chats: [], groups: [] });
+    const search = q.trim().slice(0, 100).replace(/[\\%_]/g, "\\$&");
 
     // Search messages
     const messages = await pool.query(
@@ -42,7 +43,7 @@ router.get("/search", async (req, res) => {
          WHERE pcm.chat_id=c.id AND pcm.user_id!=$1 AND c.type='direct'
          LIMIT 1
        ) peer ON TRUE
-       WHERE m.text ILIKE $2
+       WHERE m.text ILIKE $2 ESCAPE '\\'
        AND m.deleted_for_everyone = false
        AND NOT EXISTS (
          SELECT 1 FROM message_user_deletions d
@@ -51,17 +52,22 @@ router.get("/search", async (req, res) => {
        AND m.text NOT LIKE '[%'
        ORDER BY m.created_at DESC
        LIMIT 30`,
-      [req.user.userId, `%${q.trim()}%`]
+      [req.user.userId, `%${search}%`]
     );
 
     // Search contacts — all users matching query
     const chats = await pool.query(
-      `SELECT DISTINCT u.id, u.username, u.phone
+      `SELECT DISTINCT u.id, u.username, u.avatar_url
        FROM users u
        WHERE u.id != $1
-       AND u.username ILIKE $2
+       AND u.username ILIKE $2 ESCAPE '\\'
+       AND NOT EXISTS (
+         SELECT 1 FROM blocked_users bu
+         WHERE (bu.blocker_id=$1 AND bu.blocked_id=u.id)
+            OR (bu.blocker_id=u.id AND bu.blocked_id=$1)
+       )
        LIMIT 10`,
-      [req.user.userId, `%${q.trim()}%`]
+      [req.user.userId, `%${search}%`]
     );
 
     // Search groups user is a member of
@@ -71,10 +77,10 @@ router.get("/search", async (req, res) => {
        JOIN chat_members cm ON cm.chat_id = c.id AND cm.user_id = $1
        JOIN chat_members cm2 ON cm2.chat_id = c.id
        WHERE c.type = 'group'
-       AND c.name ILIKE $2
+       AND c.name ILIKE $2 ESCAPE '\\'
        GROUP BY c.id, c.name, c.type
        LIMIT 10`,
-      [req.user.userId, `%${q.trim()}%`]
+      [req.user.userId, `%${search}%`]
     );
 
     res.json({ messages: messages.rows, chats: chats.rows, groups: groups.rows });

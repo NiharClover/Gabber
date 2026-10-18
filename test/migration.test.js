@@ -21,6 +21,12 @@ test("migrated database contains P0-P4 integrity structures", { skip: process.en
     );
     assert.equal(indexes.rows.length, 3);
     const migrations = await client.query("SELECT COUNT(*)::int AS count FROM schema_migrations");
-    assert.ok(migrations.rows[0].count >= 5);
+    assert.ok(migrations.rows[0].count >= 7);
+    const businessColumns = await client.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_schema='public'
+       AND table_name='businesses' AND column_name=ANY($1::text[])`,
+      [["gstin_reference_id", "gstin_registry_status", "gstin_name_match", "gstin_checked_at"]]
+    );
+    assert.equal(businessColumns.rows.length, 4);
   } finally { await client.end(); }
 });

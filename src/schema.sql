@@ -118,7 +118,9 @@ CREATE TABLE IF NOT EXISTS reports (
 -- ─── Push notification tokens (devices.js) ─────────────────────────────
 CREATE TABLE IF NOT EXISTS device_tokens (
   user_id      VARCHAR(50) REFERENCES users(id) ON DELETE CASCADE,
-  push_token   VARCHAR(200) NOT NULL,
+  push_token   TEXT NOT NULL,
+  provider     VARCHAR(10) NOT NULL DEFAULT 'expo' CHECK (provider IN ('expo', 'fcm', 'apns')),
+  platform     VARCHAR(10) CHECK (platform IN ('android', 'ios')),
   updated_at   TIMESTAMPTZ DEFAULT NOW(),
   PRIMARY KEY (user_id, push_token)
 );
@@ -162,12 +164,26 @@ CREATE TABLE IF NOT EXISTS businesses (
   verification_docs JSONB DEFAULT '[]',
   gstin_verified BOOLEAN DEFAULT FALSE,
   gstin_legal_name TEXT,
+  gstin_trade_name TEXT,
+  gstin_registry_status VARCHAR(30),
+  gstin_reference_id VARCHAR(100),
+  gstin_registration_date DATE,
+  gstin_name_match BOOLEAN,
+  gstin_checked_at TIMESTAMPTZ,
+  gstin_provider VARCHAR(30),
   verified_at TIMESTAMPTZ,
   verified_by VARCHAR(50),
   rejection_reason TEXT,
   plan VARCHAR(20) DEFAULT 'free' CHECK (plan IN ('free','pro')),
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS gstin_trade_name TEXT;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS gstin_registry_status VARCHAR(30);
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS gstin_reference_id VARCHAR(100);
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS gstin_registration_date DATE;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS gstin_name_match BOOLEAN;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS gstin_checked_at TIMESTAMPTZ;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS gstin_provider VARCHAR(30);
 
 -- ─── Menu / catalog items (business.js) ────────────────────────────────
 CREATE TABLE IF NOT EXISTS menu_items (

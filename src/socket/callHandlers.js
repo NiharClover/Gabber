@@ -3,10 +3,12 @@ const pool = require("../db/pool");
 const { emitToUser, isUserOnline, userRoom } = require("./realtime");
 
 const calls = new Map();
+const groupCalls = new Map();
 const callByUser = new Map();
 const startingUsers = new Set();
 const RECONNECT_GRACE_MS = 15000;
 const SCREENSHOT_GRANT_MS = 60000;
+const MAX_GROUP_CALL_PARTICIPANTS = 6;
 
 function acknowledge(ack, payload) {
   if (typeof ack === "function") ack(payload);
@@ -36,6 +38,16 @@ function endSession(io, session, endedBy, reason = "ended") {
   clearSession(session);
 }
 
+function endGroupCall(io, session, reason = "ended") {
+  clearTimeout(session.lifecycleTimer);
+  for (const userId of session.participants) {
+    emitToUser(io, userId, "group-call:ended", { roomId: session.id, reason });
+    if (callByUser.get(userId) === session.id) callByUser.delete(userId);
+  }
+  session.participants.clear();
+  groupCalls.delete(session.id);
+}
+
 function relayOrQueue(io, session, recipientId, event, payload) {
   if (session.ready.has(recipientId) && isUserOnline(io, recipientId)) {
     emitToUser(io, recipientId, event, payload);
@@ -53,6 +65,77 @@ function flushQueue(io, session, userId) {
 }
 
 function registerCallHandlers(io, socket) {
+  socket.on("group-call:start", async ({ chatId, callType } = {}, ack) => {
+    if (!chatId || !["voice", "video"].includes(callType) || callByUser.has(socket.userId) || startingUsers.has(socket.userId)) {
+      return acknowledge(ack, { ok: false, error: "Invalid call request or you are already in a call." });
+    }
+    startingUsers.add(socket.userId);
+    try {
+      const result = await pool.query(
+        `SELECT c.name, cm.user_id, u.username
+         FROM chats c JOIN chat_members cm ON cm.chat_id=c.id JOIN users u ON u.id=cm.user_id
+         WHERE c.id=$1 AND c.type='group' AND EXISTS (
+           SELECT 1 FROM chat_members mine WHERE mine.chat_id=c.id AND mine.user_id=$2
+         ) ORDER BY u.username`,
+        [chatId, socket.userId]
+      );
+      if (!result.rows.length) return acknowledge(ack, { ok: false, error: "Group not found or access denied." });
+      const roomId = `gcall_${randomUUID()}`;
+      const members = new Map(result.rows.map((row) => [row.user_id, row.username]));
+      const session = { id: roomId, chatId, groupName: result.rows[0].name, callType, creator: socket.userId, members, participants: new Set(), createdAt: Date.now(), lifecycleTimer: null };
+      groupCalls.set(roomId, session);
+      session.lifecycleTimer = setTimeout(() => {
+        if (groupCalls.get(roomId) === session && !session.participants.has(session.creator)) endGroupCall(io, session, "host_unavailable");
+      }, 60000);
+      for (const [userId] of members) {
+        if (userId !== socket.userId && isUserOnline(io, userId) && !callByUser.has(userId)) {
+          emitToUser(io, userId, "group-call:incoming", { roomId, chatId, groupName: session.groupName, callType, from: socket.userId, fromName: socket.username });
+        }
+      }
+      acknowledge(ack, { ok: true, roomId, groupName: session.groupName });
+    } catch (err) {
+      console.error("[group-call:start]", err.message);
+      acknowledge(ack, { ok: false, error: "Group call could not be started." });
+    } finally {
+      startingUsers.delete(socket.userId);
+    }
+  });
+
+  socket.on("group-call:join", ({ roomId } = {}, ack) => {
+    const session = groupCalls.get(roomId);
+    if (!session || !session.members.has(socket.userId)) return acknowledge(ack, { ok: false, error: "Group call expired or access denied." });
+    const activeCall = callByUser.get(socket.userId);
+    if (activeCall && activeCall !== roomId) return acknowledge(ack, { ok: false, error: "You are already in another call." });
+    if (session.participants.size >= MAX_GROUP_CALL_PARTICIPANTS && !session.participants.has(socket.userId)) return acknowledge(ack, { ok: false, error: "Group call is full." });
+    const participants = [...session.participants].map((userId) => ({ userId, username: session.members.get(userId) || "Participant" }));
+    session.participants.add(socket.userId);
+    callByUser.set(socket.userId, roomId);
+    socket.to(userRoom(socket.userId)).emit("group-call:taken", { roomId });
+    if (socket.userId === session.creator) {
+      clearTimeout(session.lifecycleTimer);
+      session.lifecycleTimer = null;
+    }
+    for (const userId of session.participants) {
+      if (userId !== socket.userId) emitToUser(io, userId, "group-call:participant-joined", { roomId, userId: socket.userId, username: session.members.get(socket.userId) || socket.username });
+    }
+    acknowledge(ack, { ok: true, participants, groupName: session.groupName, callType: session.callType });
+  });
+
+  for (const event of ["offer", "answer", "ice"]) {
+    socket.on(`group-call:${event}`, ({ roomId, to, ...payload } = {}, ack) => {
+      const session = groupCalls.get(roomId);
+      const signal = payload[event];
+      if (!session?.participants.has(socket.userId) || !session.participants.has(to) || !signal || typeof signal !== "object") return acknowledge(ack, { ok: false, error: "Invalid group call signal." });
+      emitToUser(io, to, `group-call:${event}`, { roomId, from: socket.userId, fromName: session.members.get(socket.userId), [event]: signal });
+      acknowledge(ack, { ok: true });
+    });
+  }
+
+  socket.on("group-call:leave", ({ roomId } = {}, ack) => {
+    leaveGroupCall(io, socket.userId, roomId);
+    acknowledge(ack, { ok: true });
+  });
+
   socket.on("call:start", async ({ to, callType } = {}, ack) => {
     if (!to || to === socket.userId || !["voice", "video"].includes(callType)) {
       return acknowledge(ack, { ok: false, error: "Invalid call request." });
@@ -60,19 +143,25 @@ function registerCallHandlers(io, socket) {
     if (callByUser.has(socket.userId) || callByUser.has(to) || startingUsers.has(socket.userId) || startingUsers.has(to)) {
       return acknowledge(ack, { ok: false, error: "One of the participants is already in a call.", reason: "busy" });
     }
-    if (!isUserOnline(io, to)) {
-      return acknowledge(ack, { ok: false, error: "User is not reachable.", reason: "unavailable" });
-    }
-
     startingUsers.add(socket.userId);
     startingUsers.add(to);
     try {
-      const blocked = await pool.query(
-        `SELECT 1 FROM blocked_users
-         WHERE (blocker_id=$1 AND blocked_id=$2) OR (blocker_id=$2 AND blocked_id=$1)`,
+      const access = await pool.query(
+        `SELECT
+           EXISTS (
+             SELECT 1 FROM chat_members mine
+             JOIN chat_members peer ON peer.chat_id=mine.chat_id
+             WHERE mine.user_id=$1 AND peer.user_id=$2
+           ) AS shared_chat,
+           EXISTS (
+             SELECT 1 FROM blocked_users
+             WHERE (blocker_id=$1 AND blocked_id=$2) OR (blocker_id=$2 AND blocked_id=$1)
+           ) AS blocked`,
         [socket.userId, to]
       );
-      if (blocked.rows[0]) return acknowledge(ack, { ok: false, error: "Call is not allowed.", reason: "blocked" });
+      if (!access.rows[0]?.shared_chat || access.rows[0]?.blocked) {
+        return acknowledge(ack, { ok: false, error: "Call is not allowed.", reason: "forbidden" });
+      }
       if (callByUser.has(socket.userId) || callByUser.has(to) || !isUserOnline(io, to)) {
         return acknowledge(ack, { ok: false, error: "User is busy or unavailable.", reason: "busy" });
       }
@@ -246,6 +335,10 @@ function registerCallHandlers(io, socket) {
 
 function handleUserOffline(io, userId) {
   const callId = callByUser.get(userId);
+  if (callId && groupCalls.has(callId)) {
+    leaveGroupCall(io, userId, callId);
+    return;
+  }
   const session = callId ? calls.get(callId) : null;
   if (!session || session.disconnectTimers.has(userId)) return;
   session.ready.delete(userId);
@@ -258,6 +351,22 @@ function handleUserOffline(io, userId) {
     }
   }, RECONNECT_GRACE_MS);
   session.disconnectTimers.set(userId, timer);
+}
+
+function leaveGroupCall(io, userId, roomId) {
+  const session = groupCalls.get(roomId);
+  if (session?.creator === userId && !session.participants.has(userId)) {
+    endGroupCall(io, session, "host_unavailable");
+    return;
+  }
+  if (!session?.participants.has(userId)) return;
+  session.participants.delete(userId);
+  if (callByUser.get(userId) === roomId) callByUser.delete(userId);
+  for (const peerId of session.participants) emitToUser(io, peerId, "group-call:participant-left", { roomId, userId });
+  if (session.participants.size === 0) {
+    clearTimeout(session.lifecycleTimer);
+    groupCalls.delete(roomId);
+  }
 }
 
 module.exports = { registerCallHandlers, handleUserOffline };

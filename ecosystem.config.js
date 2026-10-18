@@ -2,8 +2,11 @@ module.exports = {
   apps: [{
     name: "gabber",
     script: "src/server.js",
-    instances: "max",
-    exec_mode: "cluster",
+    // Call sessions and Socket.IO presence are currently process-local.
+    // Keep one realtime process until both the Socket.IO adapter and call
+    // session store are moved to Redis; cluster mode splits active rooms.
+    instances: 1,
+    exec_mode: "fork",
     env: {
       NODE_ENV: "production",
       PORT: 3000,

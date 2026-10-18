@@ -1,6 +1,6 @@
 const express = require("express");
 const jwt = require("jsonwebtoken");
-const rateLimit = require("express-rate-limit");
+const { rateLimit, ipKeyGenerator } = require("express-rate-limit");
 const { randomUUID } = require("crypto");
 const { sendOTP, verifyOTP } = require("../services/sms");
 const pool = require("../db/pool");
@@ -10,13 +10,19 @@ const router = express.Router();
 const otpRateLimit = rateLimit({
   windowMs: 10 * 60 * 1000,
   max: 3,
-  keyGenerator: (req) => req.body.phone,
+  keyGenerator: (req) => `${ipKeyGenerator(req.ip)}:${String(req.body?.phone || "invalid").trim()}`,
   message: { error: "Too many OTP requests. Try again in 10 minutes." },
+});
+
+const otpVerifyRateLimit = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 10,
+  keyGenerator: (req) => `${ipKeyGenerator(req.ip)}:${String(req.body?.phone || "invalid").trim()}`,
+  message: { error: "Too many OTP attempts. Request a new code and try again later." },
 });
 
 // POST /api/auth/send-otp
 router.post("/send-otp", otpRateLimit, async (req, res) => {
-  console.log("[send-otp] hit with:", req.body);
   const { phone } = req.body;
 
   if (!phone || !/^\+[1-9]\d{9,14}$/.test(phone)) {
@@ -32,8 +38,14 @@ router.post("/send-otp", otpRateLimit, async (req, res) => {
 });
 
 // POST /api/auth/verify-otp
-router.post("/verify-otp", async (req, res) => {
+router.post("/verify-otp", otpVerifyRateLimit, async (req, res) => {
   const { phone, otp } = req.body;
+  if (typeof phone !== "string" || !/^\+[1-9]\d{9,14}$/.test(phone)) {
+    return res.status(400).json({ error: "Invalid phone number." });
+  }
+  if (typeof otp !== "string" || !/^\d{6}$/.test(otp)) {
+    return res.status(400).json({ error: "OTP must contain exactly 6 digits." });
+  }
   try {
     // verifyOTP() returns an OBJECT — { valid: true } or { valid: false, reason }
     // — which is always truthy, even when invalid. Checking `if (!verified)`
@@ -69,7 +81,7 @@ router.post("/verify-otp", async (req, res) => {
     const token = jwt.sign(
       { userId: user.id, phone: user.phone },
       process.env.JWT_SECRET,
-      { expiresIn: "30d" }
+      { algorithm: "HS256", expiresIn: process.env.JWT_EXPIRES_IN || "30d" }
     );
 
     res.json({

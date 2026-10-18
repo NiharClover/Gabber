@@ -2,13 +2,24 @@ const express = require("express");
 const { requireAuth } = require("../middleware/auth");
 const pool = require("../db/pool");
 const { randomUUID } = require("crypto");
+const { rateLimit } = require("express-rate-limit");
 
 const router = express.Router();
 router.use(requireAuth);
 
+const reportLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000,
+  max: 10,
+  keyGenerator: (req) => req.user.userId,
+  message: { error: "Too many reports. Please try again later." },
+});
+
 // POST /api/safety/block/:userId
 router.post("/block/:userId", async (req, res) => {
+  if (req.params.userId === req.user.userId) return res.status(400).json({ error: "You cannot block yourself." });
   try {
+    const target = await pool.query("SELECT 1 FROM users WHERE id=$1", [req.params.userId]);
+    if (!target.rows[0]) return res.status(404).json({ error: "User not found." });
     await pool.query(
       `INSERT INTO blocked_users (blocker_id, blocked_id) VALUES ($1, $2)
        ON CONFLICT DO NOTHING`,
@@ -64,15 +75,26 @@ router.get("/is-blocked/:userId", async (req, res) => {
 });
 
 // POST /api/safety/report/:userId
-router.post("/report/:userId", async (req, res) => {
+router.post("/report/:userId", reportLimiter, async (req, res) => {
   const { reason, details } = req.body;
-  if (!reason) return res.status(400).json({ error: "reason required." });
+  const allowedReasons = new Set(["spam", "scam", "impersonation", "harassment", "violence", "inappropriate", "child_safety", "other"]);
+  const normalizedDetails = typeof details === "string" ? details.trim().slice(0, 500) : null;
+  if (!allowedReasons.has(reason)) return res.status(400).json({ error: "Select a valid report reason." });
+  if (req.params.userId === req.user.userId) return res.status(400).json({ error: "You cannot report yourself." });
   try {
+    const target = await pool.query("SELECT 1 FROM users WHERE id=$1", [req.params.userId]);
+    if (!target.rows[0]) return res.status(404).json({ error: "User not found." });
+    const duplicate = await pool.query(
+      `SELECT 1 FROM reports WHERE reporter_id=$1 AND reported_id=$2
+       AND created_at>NOW()-INTERVAL '24 hours' LIMIT 1`,
+      [req.user.userId, req.params.userId]
+    );
+    if (duplicate.rows[0]) return res.status(409).json({ error: "You already reported this account recently." });
     const id = `report_${randomUUID().split("-")[0]}`;
     await pool.query(
       `INSERT INTO reports (id, reporter_id, reported_id, reason, details)
        VALUES ($1,$2,$3,$4,$5)`,
-      [id, req.user.userId, req.params.userId, reason, details || null]
+      [id, req.user.userId, req.params.userId, reason, normalizedDetails || null]
     );
 
     // Auto-FLAG (never auto-suspend) accounts accumulating 3+ open reports

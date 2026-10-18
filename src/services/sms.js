@@ -1,11 +1,12 @@
 const axios = require("axios");
+const { randomInt } = require("crypto");
 const redis = require("../db/redis");
 
 const OTP_TTL = 10 * 60; // 10 minutes in seconds
 const MAX_ATTEMPTS = 5;
 
 function generateOTP() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  return randomInt(100000, 1000000).toString();
 }
 
 async function sendOTP(phone) {
@@ -18,8 +19,12 @@ async function sendOTP(phone) {
   }));
 
   if (process.env.DEV_MODE === "true") {
-    console.log(`[DEV] OTP for ${phone}: ${otp}`);
+    console.warn("[DEV] OTP generated. DEV_MODE must never be enabled in production.");
     return { success: true, dev: true };
+  }
+
+  if (!process.env.MSG91_API_KEY || !process.env.MSG91_TEMPLATE_ID) {
+    throw new Error("SMS delivery is not configured");
   }
 
   // Production: send via MSG91

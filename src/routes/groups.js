@@ -129,6 +129,17 @@ router.get("/:chatId", async (req, res) => {
 // PATCH /api/groups/:chatId — update name/description (admin only)
 router.patch("/:chatId", async (req, res) => {
   const { name, description } = req.body;
+  const nextName = typeof name === "string" ? name.trim() : null;
+  const nextDescription = typeof description === "string" ? description.trim() : null;
+  if (name !== undefined && (!nextName || nextName.length < 2 || nextName.length > 100)) {
+    return res.status(400).json({ error: "Group name must be between 2 and 100 characters." });
+  }
+  if (description !== undefined && nextDescription.length > 500) {
+    return res.status(400).json({ error: "Group description must be 500 characters or fewer." });
+  }
+  if (name === undefined && description === undefined) {
+    return res.status(400).json({ error: "Nothing to update." });
+  }
   try {
     const adminCheck = await pool.query(
       "SELECT role FROM chat_members WHERE chat_id = $1 AND user_id = $2",
@@ -137,7 +148,7 @@ router.patch("/:chatId", async (req, res) => {
     if (adminCheck.rows[0]?.role !== "admin") return res.status(403).json({ error: "Admin only." });
     await pool.query(
       "UPDATE chats SET name = COALESCE($1, name), description = COALESCE($2, description) WHERE id = $3",
-      [name || null, description || null, req.params.chatId]
+      [name === undefined ? null : nextName, description === undefined ? null : nextDescription, req.params.chatId]
     );
     res.json({ success: true });
   } catch (err) {
@@ -193,10 +204,11 @@ router.post("/:chatId/members", async (req, res) => {
       [req.user.userId, userId]
     );
     if (blocked.rows[0]) return res.status(403).json({ error: "This user cannot be added." });
-    await pool.query(
+    const added = await pool.query(
       "INSERT INTO chat_members (chat_id, user_id, role) VALUES ($1,$2,'member') ON CONFLICT DO NOTHING",
       [req.params.chatId, userId]
     );
+    if (added.rowCount === 0) return res.status(409).json({ error: "User is already a member." });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Server error." });
@@ -219,10 +231,11 @@ router.delete("/:chatId/members/:userId", async (req, res) => {
       return res.status(400).json({ error: "Use the leave-group action to remove yourself." });
     }
 
-    await pool.query(
+    const removed = await pool.query(
       "DELETE FROM chat_members WHERE chat_id = $1 AND user_id = $2",
       [req.params.chatId, req.params.userId]
     );
+    if (removed.rowCount === 0) return res.status(404).json({ error: "Group member not found." });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Server error." });
@@ -252,10 +265,11 @@ router.patch("/:chatId/members/:userId/role", async (req, res) => {
       }
     }
 
-    await pool.query(
+    const updated = await pool.query(
       "UPDATE chat_members SET role = $1 WHERE chat_id = $2 AND user_id = $3",
       [role, req.params.chatId, req.params.userId]
     );
+    if (updated.rowCount === 0) return res.status(404).json({ error: "Group member not found." });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Server error." });
@@ -264,14 +278,55 @@ router.patch("/:chatId/members/:userId/role", async (req, res) => {
 
 // DELETE /api/groups/:chatId/leave — leave group
 router.delete("/:chatId/leave", async (req, res) => {
+  const client = await pool.connect();
   try {
-    await pool.query(
+    await client.query("BEGIN");
+    const membership = await client.query(
+      "SELECT role FROM chat_members WHERE chat_id=$1 AND user_id=$2 FOR UPDATE",
+      [req.params.chatId, req.user.userId]
+    );
+    if (!membership.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "You are not a member of this group." });
+    }
+
+    const successor = await client.query(
+      `SELECT user_id FROM chat_members
+       WHERE chat_id=$1 AND user_id<>$2
+       ORDER BY (role='admin') DESC, joined_at ASC
+       LIMIT 1 FOR UPDATE`,
+      [req.params.chatId, req.user.userId]
+    );
+    if (!successor.rows[0]) {
+      await client.query("DELETE FROM chats WHERE id=$1 AND type='group'", [req.params.chatId]);
+      await client.query("COMMIT");
+      return res.json({ success: true, groupDeleted: true });
+    }
+
+    if (membership.rows[0].role === "admin") {
+      const admins = await client.query(
+        "SELECT COUNT(*)::int AS count FROM chat_members WHERE chat_id=$1 AND role='admin'",
+        [req.params.chatId]
+      );
+      if (admins.rows[0].count <= 1) {
+        await client.query(
+          "UPDATE chat_members SET role='admin' WHERE chat_id=$1 AND user_id=$2",
+          [req.params.chatId, successor.rows[0].user_id]
+        );
+      }
+    }
+
+    await client.query(
       "DELETE FROM chat_members WHERE chat_id = $1 AND user_id = $2",
       [req.params.chatId, req.user.userId]
     );
+    await client.query("COMMIT");
     res.json({ success: true });
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
     res.status(500).json({ error: "Server error." });
+  } finally {
+    client.release();
   }
 });
 
