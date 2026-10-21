@@ -4,6 +4,7 @@ const { requireAuth } = require("../middleware/auth");
 const pool = require("../db/pool");
 const { normalizeOrderItems } = require("../utils/orderValidation");
 const { canBusinessTransition, toOrderDto } = require("../utils/orderLifecycle");
+const { ORDER_FULFILLMENT_MODES, CUSTOMER_COLLECTION_MODES, parseFulfillmentModes } = require("../utils/fulfillment");
 const { emitToUser } = require("../socket/realtime");
 
 const router = express.Router();
@@ -12,7 +13,7 @@ router.use(requireAuth);
 const ORDER_SELECT = `
   SELECT o.id, o.business_id, o.customer_id, o.chat_id, o.items, o.total,
          o.status, o.notes, o.created_at, o.updated_at, o.cancelled_at,
-         o.cancellation_reason, b.name AS business_name,
+         o.cancellation_reason, o.fulfillment_type, o.collected_at, b.name AS business_name,
          b.user_id AS business_owner_id, u.username AS customer_name
   FROM orders o
   JOIN businesses b ON b.id=o.business_id
@@ -79,7 +80,7 @@ function emitOrderUpdate(req, row, event = "order:updated") {
 // Creates the canonical customer/business chat, the order, and its bill
 // message in one transaction. There is no client-side best-effort gap.
 router.post("/", async (req, res) => {
-  const { businessId, chatId, items, notes } = req.body;
+  const { businessId, chatId, items, notes, fulfillmentType } = req.body;
   if (typeof businessId !== "string") return res.status(400).json({ error: "businessId is required." });
   const validation = normalizeOrderItems(items);
   if (!validation.ok) return res.status(400).json({ error: validation.error });
@@ -88,7 +89,7 @@ router.post("/", async (req, res) => {
   try {
     await client.query("BEGIN");
     const businessResult = await client.query(
-      "SELECT id, user_id, name, verification_status FROM businesses WHERE id=$1 FOR SHARE",
+      "SELECT id, user_id, name, type, verification_status, fulfillment_modes FROM businesses WHERE id=$1 FOR SHARE",
       [businessId]
     );
     const business = businessResult.rows[0];
@@ -98,6 +99,15 @@ router.post("/", async (req, res) => {
     }
     if (business.verification_status !== "verified") {
       throw Object.assign(new Error("This business is not currently verified to accept orders."), { status: 403 });
+    }
+    const enabledOrderModes = parseFulfillmentModes(business.fulfillment_modes, business.type)
+      .filter((mode) => ORDER_FULFILLMENT_MODES.has(mode));
+    if (enabledOrderModes.length === 0) {
+      throw Object.assign(new Error("This business currently accepts enquiries or bookings, not product orders."), { status: 409 });
+    }
+    const selectedFulfillment = fulfillmentType || enabledOrderModes[0];
+    if (!ORDER_FULFILLMENT_MODES.has(selectedFulfillment) || !enabledOrderModes.includes(selectedFulfillment)) {
+      throw Object.assign(new Error("Choose one of the fulfillment options offered by this business."), { status: 400 });
     }
     const blocked = await client.query(
       `SELECT 1 FROM blocked_users
@@ -140,10 +150,11 @@ router.post("/", async (req, res) => {
     const authorizedChatId = await resolveOrderChat(client, chatId, req.user.userId, business.user_id);
     const orderId = `order_${randomUUID().split("-")[0]}`;
     await client.query(
-      `INSERT INTO orders (id, business_id, customer_id, chat_id, items, total, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      `INSERT INTO orders (id, business_id, customer_id, chat_id, items, total, notes, fulfillment_type)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [orderId, businessId, req.user.userId, authorizedChatId, JSON.stringify(orderItems),
-        (totalCents / 100).toFixed(2), typeof notes === "string" ? notes.trim().slice(0, 1000) || null : null]
+        (totalCents / 100).toFixed(2), typeof notes === "string" ? notes.trim().slice(0, 1000) || null : null,
+        selectedFulfillment]
     );
 
     const summary = orderItems.map((item) => `${item.quantity}x ${item.name} ₹${item.subtotal.toFixed(2)}`).join(", ");
@@ -234,7 +245,7 @@ router.patch("/:id/status", async (req, res) => {
     const currentResult = await client.query(`${ORDER_SELECT} WHERE o.id=$1 AND b.user_id=$2 FOR UPDATE OF o`, [req.params.id, req.user.userId]);
     const current = currentResult.rows[0];
     if (!current) throw Object.assign(new Error("Order not found or not owned by your business."), { status: 404 });
-    if (!canBusinessTransition(current.status, status)) {
+    if (!canBusinessTransition(current.status, status, current.fulfillment_type)) {
       throw Object.assign(new Error(`Order cannot move from ${current.status} to ${status}.`), { status: 409 });
     }
     await client.query(
@@ -256,6 +267,45 @@ router.patch("/:id/status", async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     console.error("[orders status]", err.message);
+    res.status(err.status || 500).json({ error: err.status ? err.message : "Server error." });
+  } finally {
+    client.release();
+  }
+});
+
+// Pickup/in-store/courier orders are completed by the customer. The
+// business can mark them ready, but cannot claim that collection happened.
+router.patch("/:id/collect", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const currentResult = await client.query(
+      `${ORDER_SELECT} WHERE o.id=$1 AND o.customer_id=$2 FOR UPDATE OF o`,
+      [req.params.id, req.user.userId]
+    );
+    const current = currentResult.rows[0];
+    if (!current) throw Object.assign(new Error("Order not found."), { status: 404 });
+    if (!CUSTOMER_COLLECTION_MODES.has(current.fulfillment_type)) {
+      throw Object.assign(new Error("This order does not use customer collection."), { status: 409 });
+    }
+    if (current.status !== "ready") {
+      throw Object.assign(new Error("The business must mark this order ready before collection can be confirmed."), { status: 409 });
+    }
+    await client.query(
+      "UPDATE orders SET status='collected', collected_at=NOW(), updated_at=NOW() WHERE id=$1",
+      [req.params.id]
+    );
+    await client.query(
+      `UPDATE messages SET text=regexp_replace(text, '\\|[^|]*$', '|collected') WHERE client_message_id=$1`,
+      [`order:${req.params.id}`]
+    );
+    const updated = await client.query(`${ORDER_SELECT} WHERE o.id=$1`, [req.params.id]);
+    await client.query("COMMIT");
+    emitOrderUpdate(req, updated.rows[0]);
+    res.json({ success: true, order: toOrderDto(updated.rows[0]) });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[orders collect]", err.message);
     res.status(err.status || 500).json({ error: err.status ? err.message : "Server error." });
   } finally {
     client.release();

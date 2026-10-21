@@ -28,7 +28,7 @@ router.get("/", async (req, res) => {
     const result = await pool.query(
       `WITH candidates AS (
          SELECT b.id, b.user_id, b.name, b.type, b.phone, b.address, b.city,
-                b.pincode, b.lat, b.lng, b.verification_status, b.created_at,
+                b.pincode, b.lat, b.lng, b.verification_status, b.fulfillment_modes, b.created_at,
                 6371 * 2 * asin(sqrt(LEAST(1, GREATEST(0,
                   power(sin(radians(b.lat::double precision - $1) / 2), 2) +
                   cos(radians($1)) * cos(radians(b.lat::double precision)) *
@@ -55,6 +55,7 @@ router.get("/", async (req, res) => {
         phone: row.phone, address: row.address, city: row.city, pincode: row.pincode,
         lat: Number(row.lat), lng: Number(row.lng), distanceKm: Number(Number(row.distance_km).toFixed(2)),
         catalogueCount: row.catalogue_count, verificationStatus: row.verification_status,
+        fulfillmentModes: row.fulfillment_modes,
       })),
       query: { lat, lng, radiusKm, category: category || null, q: query || null, limit, offset },
     });

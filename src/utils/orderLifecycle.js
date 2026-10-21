@@ -1,11 +1,18 @@
 const BUSINESS_TRANSITIONS = Object.freeze({
   pending: new Set(["confirmed", "cancelled"]),
-  confirmed: new Set(["preparing", "cancelled"]),
+  confirmed: new Set(["preparing", "ready", "cancelled"]),
   preparing: new Set(["ready", "cancelled"]),
-  ready: new Set(["delivered"]),
+  ready: new Set(),
   delivered: new Set(),
+  collected: new Set(),
   cancelled: new Set(),
 });
+const { CUSTOMER_COLLECTION_MODES } = require("./fulfillment");
+
+function getBusinessNextStatuses(status, fulfillmentType = "merchant_delivery") {
+  if (status === "ready" && fulfillmentType === "merchant_delivery") return ["delivered"];
+  return [...(BUSINESS_TRANSITIONS[status] || [])];
+}
 
 function parseItems(value) {
   if (Array.isArray(value)) return value;
@@ -33,6 +40,7 @@ function normalizeOrderItem(item) {
 }
 
 function toOrderDto(row) {
+  const fulfillmentType = row.fulfillment_type || "merchant_delivery";
   return {
     id: row.id,
     status: row.status,
@@ -44,6 +52,8 @@ function toOrderDto(row) {
     updatedAt: row.updated_at || row.created_at,
     cancelledAt: row.cancelled_at || null,
     cancellationReason: row.cancellation_reason || null,
+    collectedAt: row.collected_at || null,
+    fulfillmentType,
     business: {
       id: row.business_id,
       name: row.business_name || null,
@@ -55,13 +65,14 @@ function toOrderDto(row) {
     },
     capabilities: {
       customerCanCancel: row.status === "pending" || row.status === "confirmed",
-      businessNextStatuses: [...(BUSINESS_TRANSITIONS[row.status] || [])],
+      customerCanConfirmCollection: row.status === "ready" && CUSTOMER_COLLECTION_MODES.has(fulfillmentType),
+      businessNextStatuses: getBusinessNextStatuses(row.status, fulfillmentType),
     },
   };
 }
 
-function canBusinessTransition(from, to) {
-  return BUSINESS_TRANSITIONS[from]?.has(to) === true;
+function canBusinessTransition(from, to, fulfillmentType = "merchant_delivery") {
+  return getBusinessNextStatuses(from, fulfillmentType).includes(to);
 }
 
-module.exports = { BUSINESS_TRANSITIONS, canBusinessTransition, toOrderDto };
+module.exports = { BUSINESS_TRANSITIONS, getBusinessNextStatuses, canBusinessTransition, toOrderDto };

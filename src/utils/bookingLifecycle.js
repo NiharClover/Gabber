@@ -21,6 +21,8 @@ function toBookingDto(row) {
     cancelledAt: row.cancelled_at || null,
     cancellationReason: row.cancellation_reason || null,
     chatId: row.chat_id || null,
+    fulfillmentType: row.fulfillment_type || "appointment",
+    serviceAddress: row.service_address || null,
     slot: { id: row.slot_id, startAt: row.start_at, endAt: row.end_at },
     service: row.service_item_id ? {
       id: row.service_item_id,

@@ -4,6 +4,7 @@ const { requireAuth } = require("../middleware/auth");
 const pool = require("../db/pool");
 const { emitToUser } = require("../socket/realtime");
 const { canBusinessTransition, toBookingDto } = require("../utils/bookingLifecycle");
+const { BOOKING_FULFILLMENT_MODES, parseFulfillmentModes } = require("../utils/fulfillment");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -11,6 +12,7 @@ router.use(requireAuth);
 const BOOKING_SELECT = `
   SELECT bk.id, bk.business_id, bk.customer_id, bk.slot_id, bk.service_item_id,
          bk.chat_id, bk.status, bk.notes, bk.created_at, bk.updated_at,
+         bk.fulfillment_type, bk.service_address,
          bk.cancelled_at, bk.cancellation_reason, bs.start_at, bs.end_at,
          b.name AS business_name, b.user_id AS business_owner_id,
          u.username AS customer_name, mi.name AS service_name, mi.price AS service_price
@@ -48,6 +50,7 @@ router.get("/availability/:businessId", async (req, res) => {
       `SELECT s.id, s.start_at, s.end_at FROM booking_slots s
        JOIN businesses b ON b.id=s.business_id
        WHERE s.business_id=$1 AND b.verification_status='verified' AND s.enabled=TRUE
+         AND b.fulfillment_modes ?| ARRAY['appointment','on_site_service']
          AND s.start_at >= GREATEST($2::timestamptz, NOW()) AND s.start_at < $3
          AND NOT EXISTS (SELECT 1 FROM bookings bk WHERE bk.slot_id=s.id AND bk.status IN ('pending','confirmed'))
        ORDER BY s.start_at`,
@@ -71,10 +74,10 @@ router.post("/slots", async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const biz = await client.query("SELECT id,type FROM businesses WHERE user_id=$1", [req.user.userId]);
+    const biz = await client.query("SELECT id,type,fulfillment_modes FROM businesses WHERE user_id=$1", [req.user.userId]);
     if (!biz.rows[0]) throw Object.assign(new Error("Business not found."), { status: 404 });
-    if (!["service", "hotel"].includes(biz.rows[0].type)) {
-      throw Object.assign(new Error("Only service and hotel businesses can create booking slots."), { status: 400 });
+    if (!parseFulfillmentModes(biz.rows[0].fulfillment_modes, biz.rows[0].type).some((mode) => BOOKING_FULFILLMENT_MODES.has(mode))) {
+      throw Object.assign(new Error("Enable appointments or on-site service in business settings first."), { status: 400 });
     }
     const created = [];
     for (const slot of slots) {
@@ -121,19 +124,29 @@ router.delete("/slots/:id", async (req, res) => {
 router.post("/", async (req, res) => {
   const { businessId, slotId, serviceItemId } = req.body;
   const notes = typeof req.body.notes === "string" ? req.body.notes.trim().slice(0, 1000) || null : null;
+  const fulfillmentType = typeof req.body.fulfillmentType === "string" ? req.body.fulfillmentType.trim() : "appointment";
+  const serviceAddress = typeof req.body.serviceAddress === "string" ? req.body.serviceAddress.trim().slice(0, 500) : "";
   if (typeof businessId !== "string" || typeof slotId !== "string") return res.status(400).json({ error: "Business and slot are required." });
+  if (!BOOKING_FULFILLMENT_MODES.has(fulfillmentType)) return res.status(400).json({ error: "Choose a valid appointment type." });
+  if (fulfillmentType === "on_site_service" && serviceAddress.length < 8) return res.status(400).json({ error: "Enter the address where the service is needed." });
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const slotResult = await client.query(
-      `SELECT s.id,s.business_id,s.start_at,s.end_at,b.user_id,b.name,b.type,b.verification_status
+      `SELECT s.id,s.business_id,s.start_at,s.end_at,b.user_id,b.name,b.type,b.verification_status,b.fulfillment_modes
        FROM booking_slots s JOIN businesses b ON b.id=s.business_id
        WHERE s.id=$1 AND s.business_id=$2 AND s.enabled=TRUE FOR UPDATE OF s`, [slotId, businessId]
     );
     const slot = slotResult.rows[0];
     if (!slot) throw Object.assign(new Error("Booking slot not found."), { status: 404 });
     if (slot.verification_status !== "verified") throw Object.assign(new Error("Business is not verified for bookings."), { status: 403 });
-    if (!["service", "hotel"].includes(slot.type)) throw Object.assign(new Error("This business does not accept bookings."), { status: 400 });
+    const offeredModes = parseFulfillmentModes(slot.fulfillment_modes, slot.type);
+    if (!offeredModes.some((mode) => BOOKING_FULFILLMENT_MODES.has(mode))) {
+      throw Object.assign(new Error("This business does not accept bookings."), { status: 400 });
+    }
+    if (!offeredModes.includes(fulfillmentType)) {
+      throw Object.assign(new Error("This business does not offer that appointment type."), { status: 400 });
+    }
     if (new Date(slot.start_at) <= new Date()) throw Object.assign(new Error("This slot has already started."), { status: 409 });
     if (slot.user_id === req.user.userId) throw Object.assign(new Error("You cannot book your own business."), { status: 400 });
     const blocked = await client.query(
@@ -150,8 +163,8 @@ router.post("/", async (req, res) => {
     const chatId = await directChat(client, req.user.userId, slot.user_id);
     const id = `booking_${randomUUID().split("-")[0]}`;
     await client.query(
-      `INSERT INTO bookings (id,business_id,customer_id,slot_id,service_item_id,chat_id,notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`, [id,businessId,req.user.userId,slotId,serviceItemId || null,chatId,notes]
+      `INSERT INTO bookings (id,business_id,customer_id,slot_id,service_item_id,chat_id,notes,fulfillment_type,service_address)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [id,businessId,req.user.userId,slotId,serviceItemId || null,chatId,notes,fulfillmentType,fulfillmentType === "on_site_service" ? serviceAddress : null]
     );
     const messageId = `msg_${randomUUID().split("-")[0]}`;
     const text = `[booking]${id}|${slot.name}|${new Date(slot.start_at).toISOString()}|pending`;

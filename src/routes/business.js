@@ -9,6 +9,7 @@ const { isValidGSTIN } = require("../utils/gstin");
 const { uploadBuffer, uploadPrivateBuffer } = require("../services/storage");
 const { normalizeBusinessDetails, normalizeMenuItem } = require("../utils/businessValidation");
 const { verifyGstin } = require("../services/cashfreeGstin");
+const { ORDER_FULFILLMENT_MODES, BOOKING_FULFILLMENT_MODES, parseFulfillmentModes } = require("../utils/fulfillment");
 const { rateLimit } = require("express-rate-limit");
 
 const router = express.Router();
@@ -19,25 +20,27 @@ router.use(requireAuth);
 // verified_by/rejection_reason are review metadata.
 const PUBLIC_BUSINESS_FIELDS = `
   id, user_id, name, type, phone, address, city, pincode, lat, lng,
-  verification_status, created_at
+  verification_status, fulfillment_modes, created_at
 `;
 const OWNER_BUSINESS_FIELDS = `
   id, user_id, name, type, phone, address, city, pincode, lat, lng,
   gst_number, verification_status, gstin_verified, gstin_legal_name,
   gstin_trade_name, gstin_registry_status, gstin_reference_id,
   gstin_registration_date, gstin_name_match, gstin_checked_at, gstin_provider,
-  verified_at, rejection_reason, plan, created_at
+  verified_at, rejection_reason, plan, fulfillment_modes, created_at
 `;
 
 function withCapabilities(business, isOwner = false) {
   if (!business) return null;
   const verified = business.verification_status === "verified";
+  const fulfillmentModes = parseFulfillmentModes(business.fulfillment_modes, business.type);
   return {
     ...business,
+    fulfillment_modes: fulfillmentModes,
     capabilities: {
       isPublic: verified,
-      canAcceptOrders: verified,
-      canAcceptBookings: verified && ["service", "hotel"].includes(business.type),
+      canAcceptOrders: verified && fulfillmentModes.some((mode) => ORDER_FULFILLMENT_MODES.has(mode)),
+      canAcceptBookings: verified && fulfillmentModes.some((mode) => BOOKING_FULFILLMENT_MODES.has(mode)),
       canRunAds: verified,
       canManageCatalogue: isOwner,
       canRequestVerification: isOwner && ["unverified", "rejected"].includes(business.verification_status),
@@ -84,7 +87,7 @@ const gstinVerificationLimiter = rateLimit({
 router.post("/register", async (req, res) => {
   const normalized = normalizeBusinessDetails(req.body);
   if (!normalized.ok) return res.status(400).json({ error: normalized.error });
-  const { name, type, phone, address, city, pincode, lat, lng, gstNumber } = normalized.value;
+  const { name, type, phone, address, city, pincode, lat, lng, gstNumber, fulfillmentModes } = normalized.value;
   if (gstNumber && !isValidGSTIN(gstNumber)) return res.status(400).json({ error: "Invalid GSTIN." });
   try {
     // Check if user already has a business
@@ -94,10 +97,10 @@ router.post("/register", async (req, res) => {
     }
     const id = `biz_${randomUUID().split("-")[0]}`;
     const result = await pool.query(
-      `INSERT INTO businesses (id, user_id, name, type, phone, address, city, pincode, lat, lng, gst_number)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      `INSERT INTO businesses (id, user_id, name, type, phone, address, city, pincode, lat, lng, gst_number, fulfillment_modes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
        RETURNING ${OWNER_BUSINESS_FIELDS}`,
-      [id, req.user.userId, name, type || "general", phone, address, city, pincode, lat, lng, gstNumber]
+      [id, req.user.userId, name, type || "general", phone, address, city, pincode, lat, lng, gstNumber, JSON.stringify(fulfillmentModes)]
     );
     res.status(201).json({ success: true, business: withCapabilities(result.rows[0], true) });
   } catch (err) {
@@ -141,6 +144,7 @@ router.patch("/:id", async (req, res) => {
       lat: req.body.lat ?? current.lat,
       lng: req.body.lng ?? current.lng,
       gstNumber: req.body.gstNumber ?? current.gst_number,
+      fulfillmentModes: req.body.fulfillmentModes ?? current.fulfillment_modes,
     });
     if (!normalized.ok) return res.status(400).json({ error: normalized.error });
     const value = normalized.value;
@@ -154,25 +158,25 @@ router.patch("/:id", async (req, res) => {
     const result = await pool.query(
       `UPDATE businesses
        SET name=$1, type=$2, phone=$3, address=$4, city=$5, pincode=$6,
-           lat=$7, lng=$8, gst_number=$9,
-           verification_status=CASE WHEN $10 THEN 'unverified' ELSE verification_status END,
-           verification_docs=CASE WHEN $10 THEN '[]'::jsonb ELSE verification_docs END,
-           gstin_verified=CASE WHEN $10 THEN FALSE ELSE gstin_verified END,
-           gstin_legal_name=CASE WHEN $10 THEN NULL ELSE gstin_legal_name END,
-           gstin_trade_name=CASE WHEN $10 THEN NULL ELSE gstin_trade_name END,
-           gstin_registry_status=CASE WHEN $10 THEN NULL ELSE gstin_registry_status END,
-           gstin_reference_id=CASE WHEN $10 THEN NULL ELSE gstin_reference_id END,
-           gstin_registration_date=CASE WHEN $10 THEN NULL ELSE gstin_registration_date END,
-           gstin_name_match=CASE WHEN $10 THEN NULL ELSE gstin_name_match END,
-           gstin_checked_at=CASE WHEN $10 THEN NULL ELSE gstin_checked_at END,
-           gstin_provider=CASE WHEN $10 THEN NULL ELSE gstin_provider END,
-           verified_at=CASE WHEN $10 THEN NULL ELSE verified_at END,
-           verified_by=CASE WHEN $10 THEN NULL ELSE verified_by END,
-           rejection_reason=CASE WHEN $10 THEN NULL ELSE rejection_reason END
-       WHERE id=$11 AND user_id=$12
+           lat=$7, lng=$8, gst_number=$9, fulfillment_modes=$10,
+           verification_status=CASE WHEN $11 THEN 'unverified' ELSE verification_status END,
+           verification_docs=CASE WHEN $11 THEN '[]'::jsonb ELSE verification_docs END,
+           gstin_verified=CASE WHEN $11 THEN FALSE ELSE gstin_verified END,
+           gstin_legal_name=CASE WHEN $11 THEN NULL ELSE gstin_legal_name END,
+           gstin_trade_name=CASE WHEN $11 THEN NULL ELSE gstin_trade_name END,
+           gstin_registry_status=CASE WHEN $11 THEN NULL ELSE gstin_registry_status END,
+           gstin_reference_id=CASE WHEN $11 THEN NULL ELSE gstin_reference_id END,
+           gstin_registration_date=CASE WHEN $11 THEN NULL ELSE gstin_registration_date END,
+           gstin_name_match=CASE WHEN $11 THEN NULL ELSE gstin_name_match END,
+           gstin_checked_at=CASE WHEN $11 THEN NULL ELSE gstin_checked_at END,
+           gstin_provider=CASE WHEN $11 THEN NULL ELSE gstin_provider END,
+           verified_at=CASE WHEN $11 THEN NULL ELSE verified_at END,
+           verified_by=CASE WHEN $11 THEN NULL ELSE verified_by END,
+           rejection_reason=CASE WHEN $11 THEN NULL ELSE rejection_reason END
+       WHERE id=$12 AND user_id=$13
        RETURNING ${OWNER_BUSINESS_FIELDS}`,
       [value.name, value.type, value.phone, value.address, value.city, value.pincode,
-        value.lat, value.lng, value.gstNumber, resetVerification, req.params.id, req.user.userId]
+        value.lat, value.lng, value.gstNumber, JSON.stringify(value.fulfillmentModes), resetVerification, req.params.id, req.user.userId]
     );
     res.json({
       success: true,

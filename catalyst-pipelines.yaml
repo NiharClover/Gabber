@@ -1,0 +1,56 @@
+version: 1.0
+
+runners:
+  gabber-runner:
+    config-id: 2
+
+pipeline-runner: gabber-runner
+
+# Only the protected main branch can reach the deployment stage.
+pipeline-when:
+  equal:
+    - << event.ref >>
+    - refs/heads/main
+
+jobs:
+  validate-source:
+    steps:
+      - node --version
+      - npm --version
+      - npm ci
+      - npm run check
+
+  run-tests:
+    steps:
+      - npm ci
+      - npm test
+
+  deploy-appsail:
+    steps:
+      - npm ci --omit=dev
+      - npm install -g zcatalyst-cli@1.27.2
+      - catalyst --version
+      - >-
+        catalyst deploy appsail --name gabber-api --build-path "/catalyst"
+        --stack node22 --command "npm start" --verbose
+
+stages:
+  - name: development
+    jobs:
+      - validate-source
+
+  - name: testing
+    when:
+      equal:
+        - << status.development >>
+        - success
+    jobs:
+      - run-tests
+
+  - name: deployment
+    when:
+      equal:
+        - << status.testing >>
+        - success
+    jobs:
+      - deploy-appsail

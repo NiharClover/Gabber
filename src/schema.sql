@@ -175,6 +175,7 @@ CREATE TABLE IF NOT EXISTS businesses (
   verified_by VARCHAR(50),
   rejection_reason TEXT,
   plan VARCHAR(20) DEFAULT 'free' CHECK (plan IN ('free','pro')),
+  fulfillment_modes JSONB NOT NULL DEFAULT '["pickup","in_store","chat_only"]'::jsonb,
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 ALTER TABLE businesses ADD COLUMN IF NOT EXISTS gstin_trade_name TEXT;
@@ -208,12 +209,15 @@ CREATE TABLE IF NOT EXISTS orders (
   items        JSONB,
   total        DECIMAL(10,2),
   status       VARCHAR(20) DEFAULT 'pending'
-               CHECK (status IN ('pending','confirmed','preparing','ready','delivered','cancelled')),
+               CHECK (status IN ('pending','confirmed','preparing','ready','delivered','collected','cancelled')),
+  fulfillment_type VARCHAR(30) NOT NULL DEFAULT 'merchant_delivery'
+               CHECK (fulfillment_type IN ('pickup','in_store','merchant_delivery','customer_courier')),
   notes        TEXT,
   created_at   TIMESTAMPTZ DEFAULT NOW(),
   updated_at   TIMESTAMPTZ DEFAULT NOW(),
   cancelled_at TIMESTAMPTZ,
-  cancellation_reason TEXT
+  cancellation_reason TEXT,
+  collected_at TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS booking_slots (
@@ -236,6 +240,9 @@ CREATE TABLE IF NOT EXISTS bookings (
   chat_id VARCHAR(50) REFERENCES chats(id) ON DELETE SET NULL,
   status VARCHAR(20) NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending','confirmed','completed','rejected','cancelled')),
+  fulfillment_type VARCHAR(30) NOT NULL DEFAULT 'appointment'
+    CHECK (fulfillment_type IN ('appointment','on_site_service')),
+  service_address TEXT,
   notes TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

@@ -56,8 +56,12 @@ test("group creation rejects empty or malformed member lists", () => {
 });
 
 test("business and catalogue input is normalized and bounded", () => {
-  assert.equal(normalizeBusinessDetails({ name: " Test Shop ", type: "shop", phone: "+919876543210", pincode: "411001" }).ok, true);
+  const business = normalizeBusinessDetails({ name: " Test Shop ", type: "shop", phone: "+919876543210", pincode: "411001", fulfillmentModes: ["pickup", "chat_only"] });
+  assert.equal(business.ok, true);
+  assert.deepEqual(business.value.fulfillmentModes, ["pickup", "chat_only"]);
   assert.equal(normalizeBusinessDetails({ name: "X", type: "shop" }).ok, false);
+  assert.equal(normalizeBusinessDetails({ name: "Test", type: "shop", fulfillmentModes: [] }).ok, false);
+  assert.equal(normalizeBusinessDetails({ name: "Test", type: "shop", fulfillmentModes: ["teleport"] }).ok, false);
   assert.equal(normalizeMenuItem({ name: "Tea", price: 20.5, available: false }).ok, true);
   assert.equal(normalizeMenuItem({ name: "Tea", price: -1 }).ok, false);
 });
@@ -66,6 +70,8 @@ test("order lifecycle permits only forward owner transitions", () => {
   assert.equal(canBusinessTransition("pending", "confirmed"), true);
   assert.equal(canBusinessTransition("confirmed", "pending"), false);
   assert.equal(canBusinessTransition("delivered", "cancelled"), false);
+  assert.equal(canBusinessTransition("ready", "delivered", "merchant_delivery"), true);
+  assert.equal(canBusinessTransition("ready", "delivered", "pickup"), false);
 });
 
 test("order responses expose stable typed values", () => {
@@ -80,6 +86,16 @@ test("order responses expose stable typed values", () => {
   assert.equal(dto.capabilities.customerCanCancel, true);
 });
 
+test("pickup orders require customer collection confirmation", () => {
+  const dto = toOrderDto({
+    id: "order_2", status: "ready", fulfillment_type: "pickup", items: [], total: "20.00",
+    business_id: "biz_1", customer_id: "user_1", created_at: "2026-01-01T00:00:00.000Z",
+  });
+  assert.equal(dto.fulfillmentType, "pickup");
+  assert.equal(dto.capabilities.customerCanConfirmCollection, true);
+  assert.deepEqual(dto.capabilities.businessNextStatuses, []);
+});
+
 test("booking lifecycle is forward-only and exposes customer capabilities", () => {
   assert.equal(canBookingTransition("pending", "confirmed"), true);
   assert.equal(canBookingTransition("confirmed", "pending"), false);
@@ -88,9 +104,12 @@ test("booking lifecycle is forward-only and exposes customer capabilities", () =
     business_owner_id: "owner_1", customer_id: "user_1", customer_name: "Asha",
     slot_id: "slot_1", start_at: "2026-10-01T10:00:00.000Z", end_at: "2026-10-01T10:30:00.000Z",
     service_item_id: "item_1", service_name: "Haircut", service_price: "250.00",
-    created_at: "2026-09-20T10:00:00.000Z",
+    created_at: "2026-09-20T10:00:00.000Z", fulfillment_type: "on_site_service",
+    service_address: "12 Market Road, Pune 411001",
   });
   assert.equal(dto.service.price, 250);
+  assert.equal(dto.fulfillmentType, "on_site_service");
+  assert.equal(dto.serviceAddress, "12 Market Road, Pune 411001");
   assert.equal(dto.capabilities.customerCanCancel, true);
   assert.deepEqual(dto.capabilities.businessNextStatuses, ["confirmed", "rejected"]);
 });

@@ -1,4 +1,5 @@
 const BUSINESS_TYPES = new Set(["restaurant", "hotel", "food_stall", "shop", "service", "general"]);
+const { normalizeFulfillmentModes } = require("./fulfillment");
 
 function cleanString(value, maxLength) {
   if (value == null) return null;
@@ -32,7 +33,10 @@ function normalizeBusinessDetails(input = {}) {
     return { ok: false, error: "Invalid business coordinates." };
   }
 
-  return { ok: true, value: { name, type, phone, address, city, pincode, lat, lng, gstNumber } };
+  const fulfillment = normalizeFulfillmentModes(input.fulfillmentModes ?? input.fulfillment_modes, type);
+  if (!fulfillment.ok) return fulfillment;
+
+  return { ok: true, value: { name, type, phone, address, city, pincode, lat, lng, gstNumber, fulfillmentModes: fulfillment.modes } };
 }
 
 function normalizeMenuItem(input = {}) {
