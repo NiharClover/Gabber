@@ -1,4 +1,7 @@
-require("dotenv").config({ path: require("path").join(__dirname, ".env") });
+require("dotenv").config({
+  path: require("path").join(__dirname, ".env"),
+  override: true,
+});
 
 module.exports = {
   apps: [{
@@ -10,8 +13,9 @@ module.exports = {
     instances: 1,
     exec_mode: "fork",
     env: {
-      // Read the environment from the server's .env, defaulting safely to prod.
+      // Pass the server .env mode through to PM2; default safely to production.
       NODE_ENV: process.env.NODE_ENV || "production",
+      DEV_MODE: process.env.DEV_MODE || "false",
       PORT: 3000,
     },
     error_file: "./logs/err.log",
