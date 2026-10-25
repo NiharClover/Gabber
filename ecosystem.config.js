@@ -13,9 +13,16 @@ module.exports = {
     instances: 1,
     exec_mode: "fork",
     env: {
-      // Pass the server .env mode through to PM2; default safely to production.
-      NODE_ENV: process.env.NODE_ENV || "production",
-      DEV_MODE: process.env.DEV_MODE || "false",
+      // Default to the no-SMS OTP flow while testing.
+      NODE_ENV: "development",
+      DEV_MODE: "true",
+      PORT: 3000,
+    },
+    // Select explicitly for real SMS production service:
+    // pm2 start ecosystem.config.js --env production
+    env_production: {
+      NODE_ENV: "production",
+      DEV_MODE: "false",
       PORT: 3000,
     },
     error_file: "./logs/err.log",
