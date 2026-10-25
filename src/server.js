@@ -154,9 +154,8 @@ io.on("connection", (socket) => {
 
 startCleanupScheduler();
 
-// AppSail injects X_ZOHO_CATALYST_LISTEN_PORT. Keep PORT as the fallback for
-// local development and other hosting environments.
-const PORT = process.env.X_ZOHO_CATALYST_LISTEN_PORT || process.env.PORT || 3000;
+// Use PORT from the selected hosting environment; default to 3000 locally.
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Gabber server running on http://localhost:${PORT}`);
 });
