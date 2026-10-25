@@ -1,3 +1,5 @@
+require("dotenv").config({ path: require("path").join(__dirname, ".env") });
+
 module.exports = {
   apps: [{
     name: "gabber",
@@ -8,7 +10,8 @@ module.exports = {
     instances: 1,
     exec_mode: "fork",
     env: {
-      NODE_ENV: "production",
+      // Read the environment from the server's .env, defaulting safely to prod.
+      NODE_ENV: process.env.NODE_ENV || "production",
       PORT: 3000,
     },
     error_file: "./logs/err.log",
