@@ -8,7 +8,7 @@ const sharp = require("sharp");
 const { isValidGSTIN } = require("../utils/gstin");
 const { uploadBuffer, uploadPrivateBuffer } = require("../services/storage");
 const { normalizeBusinessDetails, normalizeMenuItem } = require("../utils/businessValidation");
-const { verifyGstin } = require("../services/cashfreeGstin");
+const { verifyGstin } = require("../services/gstinPortal");
 const { ORDER_FULFILLMENT_MODES, BOOKING_FULFILLMENT_MODES, parseFulfillmentModes } = require("../utils/fulfillment");
 const { rateLimit } = require("express-rate-limit");
 
@@ -460,7 +460,7 @@ router.post(
              gstin_registration_date = $7,
              gstin_name_match = $8,
              gstin_checked_at = NOW(),
-             gstin_provider = 'cashfree',
+             gstin_provider = 'gstin_portal',
              rejection_reason = NULL
          WHERE id = $9 AND verification_status IN ('unverified','rejected')
          RETURNING id, verification_status, gstin_verified, gstin_legal_name,

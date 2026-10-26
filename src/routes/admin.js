@@ -11,7 +11,7 @@ router.use(requireAdmin);
 
 // GET /api/admin/businesses/pending
 // Manual review checklist for the reviewer (not automated):
-//   1. Confirm Cashfree returned an active GSTIN and review its reference id.
+//   1. Confirm GSTIN Portal returned an active GSTIN and review its reference id.
 //   2. Compare registered legal name to the entered business name — flag
 //      mismatches for follow-up, don't auto-reject (name variations happen).
 //   3. Sanity-check registered business category vs. what they're listing.
@@ -80,7 +80,7 @@ router.post("/businesses/:id/verify", async (req, res) => {
       if (!existing.rows[0]) return res.status(404).json({ error: "Business not found." });
       return res.status(409).json({
         error: approve
-          ? "Only a pending business with an active Cashfree-verified GSTIN can be approved."
+          ? "Only a pending business with an active GSTIN Portal-verified GSTIN can be approved."
           : "Only a pending verification can be rejected.",
       });
     }
