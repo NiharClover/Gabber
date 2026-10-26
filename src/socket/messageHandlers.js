@@ -296,12 +296,12 @@ function registerMessageHandlers(io, socket) {
       if (!membership.rows[0]) return acknowledge(ack, { ok: false, error: "Not a chat member." });
 
       const changed = await pool.query(
-        `INSERT INTO message_receipts (message_id, user_id, status, delivered_at, read_at)
-         SELECT m.id, $2, 'read', NOW(), NOW()
+        `INSERT INTO message_receipts (message_id, user_id, status)
+         SELECT m.id, $2, 'read'
          FROM messages m
          WHERE m.chat_id=$1 AND m.sender_id!=$2
          ON CONFLICT (message_id, user_id) DO UPDATE
-         SET status='read', delivered_at=COALESCE(message_receipts.delivered_at, NOW()), read_at=NOW()
+         SET status='read'
          RETURNING message_id`,
         [chatId, socket.userId]
       );

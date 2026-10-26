@@ -144,11 +144,11 @@ router.post("/:chatId/read", async (req, res) => {
     }
 
     await pool.query(
-      `INSERT INTO message_receipts (message_id, user_id, status, delivered_at, read_at)
-       SELECT id, $2, 'read', NOW(), NOW() FROM messages
+      `INSERT INTO message_receipts (message_id, user_id, status)
+       SELECT id, $2, 'read' FROM messages
        WHERE chat_id=$1 AND sender_id!=$2
        ON CONFLICT (message_id, user_id) DO UPDATE
-       SET status='read', delivered_at=COALESCE(message_receipts.delivered_at, NOW()), read_at=NOW()`,
+       SET status='read'`,
       [req.params.chatId, req.user.userId]
     );
     await pool.query(
@@ -169,6 +169,7 @@ router.post("/:chatId/read", async (req, res) => {
     );
     res.json({ success: true });
   } catch (err) {
+    console.error("[chats:read] Error:", err.message);
     res.status(500).json({ error: "Server error." });
   }
 });
