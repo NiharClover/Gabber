@@ -178,6 +178,7 @@ function registerCallHandlers(io, socket) {
         queues: new Map([[socket.userId, []], [to, []]]),
         disconnectTimers: new Map(),
         screenshotRequests: new Map(),
+        videoUpgradeRequests: new Map(),
         screenshotGrants: new Map(),
         lifecycleTimer: null,
         createdAt: Date.now(),
@@ -244,6 +245,41 @@ function registerCallHandlers(io, socket) {
     relayOrQueue(io, session, peer, "call:ice", { callId: session.id, candidate });
     acknowledge(ack, { ok: true });
   });
+
+  socket.on("call:video:request", ({ callId } = {}, ack) => {
+    const session = getSession(callId, socket.userId);
+    if (!session || session.state !== "connected") return acknowledge(ack, { ok: false, error: "Call is not connected." });
+    const requestId = `video_${randomUUID()}`;
+    const responder = otherUser(session, socket.userId);
+    session.videoUpgradeRequests.set(requestId, { requester: socket.userId, responder, expiresAt: Date.now() + 30000 });
+    emitToUser(io, responder, "call:video:request", { callId: session.id, requestId, from: socket.userId });
+    acknowledge(ack, { ok: true, requestId });
+  });
+
+  socket.on("call:video:response", ({ callId, requestId, approved } = {}, ack) => {
+    const session = getSession(callId, socket.userId);
+    const request = session?.videoUpgradeRequests.get(requestId);
+    if (!session || !request || request.responder !== socket.userId || request.expiresAt < Date.now()) {
+      return acknowledge(ack, { ok: false, error: "Video request is invalid or expired." });
+    }
+    session.videoUpgradeRequests.delete(requestId);
+    emitToUser(io, request.requester, "call:video:response", { callId: session.id, requestId, approved: approved === true });
+    acknowledge(ack, { ok: true });
+  });
+
+  for (const [event, signalName] of [["call:video:offer", "offer"], ["call:video:answer", "answer"]]) {
+    socket.on(event, (payload = {}, ack) => {
+      const session = getSession(payload.callId, socket.userId);
+      if (!session || session.state !== "connected" || !payload[signalName]) {
+        return acknowledge(ack, { ok: false, error: "Invalid video upgrade signal." });
+      }
+      emitToUser(io, otherUser(session, socket.userId), event, {
+        callId: session.id,
+        [signalName]: payload[signalName],
+      });
+      acknowledge(ack, { ok: true });
+    });
+  }
 
   socket.on("call:reject", ({ callId } = {}, ack) => {
     const session = getSession(callId, socket.userId);

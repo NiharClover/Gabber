@@ -49,14 +49,14 @@ async function pushToUser(userId, data) {
 
 async function deriveAndNotifyStatus(io, messageId) {
   const result = await pool.query(
-    `SELECT m.sender_id,
+    `SELECT m.sender_id, m.client_message_id,
             COUNT(r.user_id)::int AS recipient_count,
             COUNT(*) FILTER (WHERE r.status IN ('delivered','read'))::int AS delivered_count,
             COUNT(*) FILTER (WHERE r.status='read')::int AS read_count
      FROM messages m
      LEFT JOIN message_receipts r ON r.message_id=m.id
      WHERE m.id=$1
-     GROUP BY m.id, m.sender_id`,
+     GROUP BY m.id, m.sender_id, m.client_message_id`,
     [messageId]
   );
   const row = result.rows[0];
@@ -69,11 +69,51 @@ async function deriveAndNotifyStatus(io, messageId) {
   await pool.query("UPDATE messages SET status=$1 WHERE id=$2", [status, messageId]);
   emitToUser(io, row.sender_id, "message:status", {
     id: messageId,
+    clientMessageId: row.client_message_id,
     status,
     recipientCount: row.recipient_count,
     deliveredCount: row.delivered_count,
     readCount: row.read_count,
   });
+}
+
+async function deriveAndNotifyStatuses(io, messageIds) {
+  const ids = [...new Set(messageIds)].filter(Boolean);
+  if (ids.length === 0) return;
+  const result = await pool.query(
+    `WITH receipt_totals AS (
+       SELECT m.id, m.sender_id, m.client_message_id,
+              COUNT(r.user_id)::int AS recipient_count,
+              COUNT(*) FILTER (WHERE r.status IN ('delivered','read'))::int AS delivered_count,
+              COUNT(*) FILTER (WHERE r.status='read')::int AS read_count
+       FROM messages m
+       LEFT JOIN message_receipts r ON r.message_id=m.id
+       WHERE m.id=ANY($1::varchar[])
+       GROUP BY m.id, m.sender_id, m.client_message_id
+     ), statuses AS (
+       SELECT *, CASE
+         WHEN recipient_count > 0 AND read_count=recipient_count THEN 'read'
+         WHEN recipient_count > 0 AND delivered_count=recipient_count THEN 'delivered'
+         ELSE 'sent'
+       END AS status
+       FROM receipt_totals
+     )
+     UPDATE messages m SET status=s.status
+     FROM statuses s WHERE m.id=s.id
+     RETURNING m.id, s.sender_id, s.client_message_id, s.status, s.recipient_count,
+               s.delivered_count, s.read_count`,
+    [ids]
+  );
+  for (const row of result.rows) {
+    emitToUser(io, row.sender_id, "message:status", {
+      id: row.id,
+      clientMessageId: row.client_message_id,
+      status: row.status,
+      recipientCount: row.recipient_count,
+      deliveredCount: row.delivered_count,
+      readCount: row.read_count,
+    });
+  }
 }
 
 async function markDelivered(io, messageId, recipientIds) {
@@ -265,7 +305,7 @@ function registerMessageHandlers(io, socket) {
          RETURNING message_id`,
         [chatId, socket.userId]
       );
-      for (const row of changed.rows) await deriveAndNotifyStatus(io, row.message_id);
+      await deriveAndNotifyStatuses(io, changed.rows.map((row) => row.message_id));
       socket.emit("chat:updated", { chatId, unread_count: 0 });
       acknowledge(ack, { ok: true });
     } catch (err) {
@@ -329,7 +369,7 @@ async function reconcileUserMessages(io, userId) {
        WHERE user_id=$1 AND status='sent' RETURNING message_id`,
       [userId]
     );
-    for (const row of delivered.rows) await deriveAndNotifyStatus(io, row.message_id);
+    await deriveAndNotifyStatuses(io, delivered.rows.map((row) => row.message_id));
   } catch (err) {
     console.error("[message reconcile]", err.message);
   }
