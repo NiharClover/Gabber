@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 ALTER TABLE users ADD COLUMN IF NOT EXISTS about TEXT DEFAULT 'Hey there! I am using Gabber.';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(100);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS can_access_forensics BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- ─── Chats (direct or group) ───────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS chats (
@@ -61,6 +62,17 @@ CREATE TABLE IF NOT EXISTS messages (
   deleted_for_everyone  BOOLEAN DEFAULT FALSE,
   deleted_for_sender    BOOLEAN DEFAULT FALSE,
   viewed_at             TIMESTAMPTZ,
+  forwarded_from_message_id VARCHAR(50) CONSTRAINT fk_messages_forwarded_from REFERENCES messages(id) ON DELETE SET NULL,
+  provenance_root_message_id VARCHAR(50) CONSTRAINT fk_messages_provenance_root REFERENCES messages(id) ON DELETE SET NULL,
+  provenance_origin_sender_id VARCHAR(50) CONSTRAINT fk_messages_provenance_origin_sender REFERENCES users(id) ON DELETE SET NULL,
+  provenance_kind       VARCHAR(20) NOT NULL DEFAULT 'original'
+                        CONSTRAINT ck_messages_provenance_kind CHECK (provenance_kind IN ('original','forwarded','copied_media','copied_text')),
+  forward_depth         INTEGER NOT NULL DEFAULT 0 CONSTRAINT ck_messages_forward_depth CHECK (forward_depth >= 0),
+  content_sha256        VARCHAR(64),
+  safety_status         VARCHAR(20) NOT NULL DEFAULT 'safe'
+                        CONSTRAINT ck_messages_safety_status CHECK (safety_status IN ('safe','caution','blocked','unscanned')),
+  safety_flags          JSONB NOT NULL DEFAULT '[]',
+  media_asset_id        VARCHAR(50),
   created_at            TIMESTAMPTZ DEFAULT NOW()
 );
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id VARCHAR(50);
@@ -70,6 +82,15 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_for_everyone BOOLEAN DEFAU
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_for_sender BOOLEAN DEFAULT FALSE;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS viewed_at TIMESTAMPTZ;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_message_id VARCHAR(100);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_message_id VARCHAR(50);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS provenance_root_message_id VARCHAR(50);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS provenance_origin_sender_id VARCHAR(50);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS provenance_kind VARCHAR(20) NOT NULL DEFAULT 'original';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS forward_depth INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS content_sha256 VARCHAR(64);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS safety_status VARCHAR(20) NOT NULL DEFAULT 'safe';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS safety_flags JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_asset_id VARCHAR(50);
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_sender_client_id
   ON messages(sender_id, client_message_id)
@@ -97,6 +118,59 @@ CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_chat_members_user_id ON chat_members(user_id);
 CREATE INDEX IF NOT EXISTS idx_message_receipts_user_status ON message_receipts(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_message_user_deletions_user ON message_user_deletions(user_id);
+CREATE INDEX IF NOT EXISTS idx_messages_forwarded_from ON messages(forwarded_from_message_id);
+CREATE INDEX IF NOT EXISTS idx_messages_provenance_root ON messages(provenance_root_message_id);
+CREATE INDEX IF NOT EXISTS idx_messages_content_sha256 ON messages(content_sha256);
+
+-- Uploaded-media fingerprints let Gabber connect re-uploaded copies to the
+-- first in-app upload without placing hidden user identifiers in the file.
+CREATE TABLE IF NOT EXISTS media_assets (
+  id                   VARCHAR(50) PRIMARY KEY,
+  uploader_id          VARCHAR(50) REFERENCES users(id) ON DELETE SET NULL,
+  origin_asset_id      VARCHAR(50) REFERENCES media_assets(id) ON DELETE SET NULL,
+  media_type           VARCHAR(10) NOT NULL CHECK (media_type IN ('image','video')),
+  url                  TEXT UNIQUE NOT NULL,
+  filename             TEXT NOT NULL,
+  sha256               VARCHAR(64) NOT NULL,
+  perceptual_hash      VARCHAR(64),
+  scan_status          VARCHAR(20) NOT NULL DEFAULT 'sanitized'
+                       CHECK (scan_status IN ('sanitized','clean','pending','blocked')),
+  scan_details         JSONB NOT NULL DEFAULT '{}',
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_messages_media_asset') THEN
+    ALTER TABLE messages ADD CONSTRAINT fk_messages_media_asset
+      FOREIGN KEY (media_asset_id) REFERENCES media_assets(id) ON DELETE SET NULL;
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_messages_media_asset ON messages(media_asset_id) WHERE media_asset_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_media_assets_sha256 ON media_assets(sha256);
+CREATE INDEX IF NOT EXISTS idx_media_assets_perceptual_hash ON media_assets(perceptual_hash) WHERE perceptual_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_media_assets_origin ON media_assets(origin_asset_id);
+
+-- A different opaque code is shown to each media recipient. The code contains
+-- no user data; authorized reviewers can resolve it using the audit table.
+CREATE TABLE IF NOT EXISTS message_trace_deliveries (
+  message_id       VARCHAR(50) NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  recipient_id     VARCHAR(50) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  trace_code       VARCHAR(24) NOT NULL UNIQUE,
+  delivered_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (message_id, recipient_id)
+);
+CREATE INDEX IF NOT EXISTS idx_message_trace_recipient ON message_trace_deliveries(recipient_id, delivered_at DESC);
+
+CREATE TABLE IF NOT EXISTS forensic_access_logs (
+  id             BIGSERIAL PRIMARY KEY,
+  reviewer_id    VARCHAR(50) REFERENCES users(id) ON DELETE SET NULL,
+  lookup_type    VARCHAR(30) NOT NULL,
+  lookup_value   TEXT NOT NULL,
+  result_found   BOOLEAN NOT NULL,
+  requester_ip   TEXT,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_forensic_access_logs_reviewer ON forensic_access_logs(reviewer_id, created_at DESC);
 
 -- ─── Blocking & reporting (safety.js) ──────────────────────────────────
 CREATE TABLE IF NOT EXISTS blocked_users (

@@ -1,6 +1,6 @@
 const express = require("express");
 const { requireAuth } = require("../middleware/auth");
-const { getUserChats, getChatMessages, getOrCreateDirectChat } = require("../db/queries");
+const { getUserChats, getOrCreateDirectChat } = require("../db/queries");
 const pool = require("../db/pool");
 const router = express.Router();
 
@@ -30,7 +30,9 @@ router.get("/search", async (req, res) => {
 
     // Search messages
     const messages = await pool.query(
-      `SELECT m.*, u.username AS sender_name, c.type AS chat_type,
+      `SELECT m.id, m.chat_id, m.sender_id, m.text, m.created_at,
+              m.provenance_kind, m.forward_depth, m.safety_status,
+              u.username AS sender_name, c.type AS chat_type,
               c.name AS group_name, peer.id AS other_user_id,
               peer.username AS other_username
        FROM messages m
@@ -109,7 +111,10 @@ router.get("/:chatId/messages", async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT m.*, u.username AS sender_name
+      `SELECT m.id, m.chat_id, m.sender_id, m.client_message_id, m.text,
+              m.status, m.reply_to_id, m.reply_to_text, m.reply_to_sender,
+              m.viewed_at, m.created_at, m.provenance_kind, m.forward_depth,
+              m.safety_status, u.username AS sender_name
        FROM messages m
        JOIN users u ON u.id = m.sender_id
        WHERE m.chat_id = $1

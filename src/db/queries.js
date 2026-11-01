@@ -242,14 +242,18 @@ async function saveMessage({ chatId, senderId, text }) {
 
 async function getChatMessages(chatId, limit = 50, before = null) {
   let query, params;
+  const publicMessageFields = `m.id, m.chat_id, m.sender_id, m.client_message_id,
+             m.text, m.status, m.reply_to_id, m.reply_to_text, m.reply_to_sender,
+             m.viewed_at, m.created_at, m.provenance_kind, m.forward_depth,
+             m.safety_status, u.username AS sender_name`;
   if (before) {
-    query = `SELECT m.*, u.username AS sender_name FROM messages m
+    query = `SELECT ${publicMessageFields} FROM messages m
              JOIN users u ON u.id = m.sender_id
              WHERE m.chat_id = $1 AND m.created_at < $2
              ORDER BY m.created_at DESC LIMIT $3`;
     params = [chatId, before, limit];
   } else {
-    query = `SELECT m.*, u.username AS sender_name FROM messages m
+    query = `SELECT ${publicMessageFields} FROM messages m
              JOIN users u ON u.id = m.sender_id
              WHERE m.chat_id = $1
              ORDER BY m.created_at DESC LIMIT $2`;

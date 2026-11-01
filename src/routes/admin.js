@@ -4,10 +4,107 @@ const { requireAdmin } = require("../middleware/admin");
 const pool = require("../db/pool");
 const { multiBusinessOwners, verifiedOrderSpikes, reusedGstins } = require("../services/fraudSignals");
 const { getPrivateFileAccess } = require("../services/storage");
+const { requireForensics } = require("../middleware/forensics");
 
 const router = express.Router();
 router.use(requireAuth);
 router.use(requireAdmin);
+
+// Resolve the disclosed opaque code visible on a leaked media copy. This is
+// intentionally admin-only because it identifies the account that received
+// that particular delivery.
+router.get("/media-trace/:code", requireForensics, async (req, res) => {
+  try {
+    const code = String(req.params.code || "").toUpperCase();
+    if (!/^GBR-[A-F0-9]{5}-[A-F0-9]{5}-[A-F0-9]{6}$/.test(code)) {
+      return res.status(400).json({ error: "Invalid trace code." });
+    }
+    const result = await pool.query(
+      `SELECT t.trace_code, t.message_id, t.delivered_at,
+              recipient.id AS recipient_id, recipient.username AS recipient_username,
+              sender.id AS sender_id, sender.username AS sender_username,
+              m.chat_id, m.provenance_root_message_id, m.content_sha256,
+              m.provenance_kind, m.forward_depth, m.media_asset_id,
+              media.uploader_id AS media_last_uploader_id,
+              media_uploader.username AS media_last_uploader_name
+       FROM message_trace_deliveries t
+       JOIN messages m ON m.id=t.message_id
+       JOIN users recipient ON recipient.id=t.recipient_id
+       LEFT JOIN users sender ON sender.id=m.sender_id
+       LEFT JOIN media_assets media ON media.id=m.media_asset_id
+       LEFT JOIN users media_uploader ON media_uploader.id=media.uploader_id
+       WHERE t.trace_code=$1`,
+      [code]
+    );
+    await pool.query(
+      `INSERT INTO forensic_access_logs
+       (reviewer_id,lookup_type,lookup_value,result_found,requester_ip)
+       VALUES ($1,'media_trace',$2,$3,$4)`,
+      [req.user.userId, code, Boolean(result.rows[0]), req.ip]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: "Trace code not found." });
+    res.json({ trace: result.rows[0] });
+  } catch (err) {
+    console.error("[admin media-trace]", err.message);
+    res.status(500).json({ error: "Server error." });
+  }
+});
+
+// Full chain lookup for authorized forensic reviewers. Unlike normal chat
+// APIs, this includes identities, asset hashes and per-recipient trace codes.
+router.get("/message-provenance/:messageId", requireForensics, async (req, res) => {
+  try {
+    const messageId = String(req.params.messageId || "");
+    if (!/^[A-Za-z0-9_.:-]{1,50}$/.test(messageId)) {
+      return res.status(400).json({ error: "Invalid message id." });
+    }
+    const result = await pool.query(
+      `WITH RECURSIVE chain AS (
+         SELECT m.id, m.forwarded_from_message_id, 0 AS hop
+         FROM messages m WHERE m.id=$1
+         UNION ALL
+         SELECT parent.id, parent.forwarded_from_message_id, chain.hop + 1
+         FROM chain JOIN messages parent ON parent.id=chain.forwarded_from_message_id
+         WHERE chain.hop < 100
+       )
+       SELECT chain.hop, m.id, m.chat_id, m.created_at, m.provenance_kind,
+              m.forward_depth, m.content_sha256, m.media_asset_id,
+              sender.id AS sender_id, sender.username AS sender_username,
+              media.sha256 AS media_sha256, media.perceptual_hash,
+              uploader.id AS media_last_uploader_id,
+              uploader.username AS media_last_uploader_name,
+              COALESCE((
+                SELECT json_agg(json_build_object(
+                  'traceCode', t.trace_code,
+                  'recipientId', recipient.id,
+                  'recipientUsername', recipient.username,
+                  'deliveredAt', t.delivered_at
+                ) ORDER BY t.delivered_at)
+                FROM message_trace_deliveries t
+                JOIN users recipient ON recipient.id=t.recipient_id
+                WHERE t.message_id=m.id
+              ), '[]'::json) AS deliveries
+       FROM chain
+       JOIN messages m ON m.id=chain.id
+       LEFT JOIN users sender ON sender.id=m.sender_id
+       LEFT JOIN media_assets media ON media.id=m.media_asset_id
+       LEFT JOIN users uploader ON uploader.id=media.uploader_id
+       ORDER BY chain.hop ASC`,
+      [messageId]
+    );
+    await pool.query(
+      `INSERT INTO forensic_access_logs
+       (reviewer_id,lookup_type,lookup_value,result_found,requester_ip)
+       VALUES ($1,'message_provenance',$2,$3,$4)`,
+      [req.user.userId, messageId, result.rows.length > 0, req.ip]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Message not found." });
+    res.json({ chain: result.rows });
+  } catch (err) {
+    console.error("[admin message-provenance]", err.message);
+    res.status(500).json({ error: "Server error." });
+  }
+});
 
 // GET /api/admin/businesses/pending
 // Manual review checklist for the reviewer (not automated):

@@ -3,6 +3,8 @@ const pool = require("../db/pool");
 const { getOrCreateDirectChat } = require("../db/queries");
 const { sendPushNotification } = require("../services/push");
 const { emitToUser, isUserOnline } = require("./realtime");
+const { assessMessageSafety, extractUrls, parseMediaReference, sha256 } = require("../utils/contentSafety");
+const { createTraceCode, isTraceableMedia } = require("../services/mediaTrace");
 
 function acknowledge(ack, payload) {
   if (typeof ack === "function") ack(payload);
@@ -29,6 +31,9 @@ function messagePayload(msg, extras = {}) {
     reply_to_id: msg.reply_to_id,
     reply_to_text: msg.reply_to_text,
     reply_to_sender: msg.reply_to_sender,
+    provenance_kind: msg.provenance_kind || "original",
+    forward_depth: Number(msg.forward_depth || 0),
+    safety_status: msg.safety_status || "safe",
     created_at: msg.created_at,
     timestamp: msg.created_at,
     ...extras,
@@ -129,8 +134,117 @@ async function markDelivered(io, messageId, recipientIds) {
   await deriveAndNotifyStatus(io, messageId);
 }
 
-async function insertMessage(client, { chatId, senderId, text, replyTo, clientMessageId, recipientIds }) {
+async function insertMessage(client, {
+  chatId, senderId, text, replyTo, clientMessageId, recipientIds, forwardedFromMessageId,
+}) {
   const messageId = `msg_${randomUUID().split("-")[0]}`;
+  let resolvedText = typeof text === "string" ? text.trim() : "";
+  let forwardedFrom = null;
+  let provenanceRoot = null;
+  let originSenderId = null;
+  let provenanceKind = "original";
+  let forwardDepth = 0;
+  let contentHash = null;
+  let safetyStatus = "safe";
+  let safetyFlags = [];
+  let mediaAssetId = null;
+
+  if (forwardedFromMessageId) {
+    const sourceResult = await client.query(
+      `SELECT m.*
+       FROM messages m
+       JOIN chat_members viewer ON viewer.chat_id=m.chat_id AND viewer.user_id=$2
+       WHERE m.id=$1 AND m.deleted_for_everyone=FALSE
+         AND NOT EXISTS (
+           SELECT 1 FROM message_user_deletions d
+           WHERE d.message_id=m.id AND d.user_id=$2
+         )`,
+      [forwardedFromMessageId, senderId]
+    );
+    const source = sourceResult.rows[0];
+    if (!source) {
+      const error = new Error("Forward source is unavailable.");
+      error.publicMessage = "The original message is unavailable.";
+      throw error;
+    }
+    if (source.text?.startsWith("[view-once]")) {
+      const error = new Error("View-once media cannot be forwarded.");
+      error.publicMessage = "View-once media cannot be forwarded.";
+      throw error;
+    }
+    if (Number(source.forward_depth || 0) >= 100) {
+      const error = new Error("Forward chain limit reached.");
+      error.publicMessage = "This message cannot be forwarded again.";
+      throw error;
+    }
+    resolvedText = source.text;
+    forwardedFrom = source.id;
+    provenanceRoot = source.provenance_root_message_id || source.id;
+    originSenderId = source.provenance_origin_sender_id || source.sender_id;
+    forwardDepth = Number(source.forward_depth || 0) + 1;
+    provenanceKind = "forwarded";
+    contentHash = source.content_sha256 || sha256(source.text || "");
+    safetyStatus = source.safety_status || "safe";
+    safetyFlags = Array.isArray(source.safety_flags) ? source.safety_flags : [];
+    mediaAssetId = source.media_asset_id || null;
+  } else {
+    const assessment = assessMessageSafety(resolvedText);
+    safetyStatus = assessment.status;
+    safetyFlags = assessment.flags;
+    const media = parseMediaReference(resolvedText);
+    if (media) {
+      const assetResult = await client.query(
+        `SELECT a.id, a.uploader_id, a.sha256, a.scan_status, a.origin_asset_id,
+                COALESCE(root.uploader_id, a.uploader_id) AS origin_uploader_id
+         FROM media_assets a
+         LEFT JOIN media_assets root ON root.id=a.origin_asset_id
+         WHERE a.url=$1`,
+        [media.url]
+      );
+      const asset = assetResult.rows[0];
+      if (!asset || !["sanitized", "clean"].includes(asset.scan_status)) {
+        const error = new Error("Unverified media reference rejected.");
+        error.publicMessage = "This media has not passed Gabber's safety checks.";
+        throw error;
+      }
+      contentHash = asset.sha256;
+      mediaAssetId = asset.id;
+      originSenderId = asset.origin_uploader_id || senderId;
+      provenanceKind = asset.origin_asset_id ? "copied_media" : "original";
+      safetyStatus = "safe";
+      safetyFlags = [];
+    } else {
+      contentHash = sha256(resolvedText);
+      // Manual copy/paste cannot carry a client-supplied parent ID. For long
+      // text and links, connect an exact copy only to an earlier message the
+      // sender was entitled to read. This avoids searching private chats.
+      if (resolvedText.length >= 80 || extractUrls(resolvedText).length > 0) {
+        const priorResult = await client.query(
+          `SELECT m.id, m.sender_id, m.provenance_root_message_id,
+                  m.provenance_origin_sender_id, m.forward_depth
+           FROM messages m
+           JOIN chat_members viewer ON viewer.chat_id=m.chat_id AND viewer.user_id=$2
+           WHERE m.content_sha256=$1 AND m.deleted_for_everyone=FALSE
+             AND NOT EXISTS (
+               SELECT 1 FROM message_user_deletions d
+               WHERE d.message_id=m.id AND d.user_id=$2
+             )
+           ORDER BY m.created_at ASC
+           LIMIT 1`,
+          [contentHash, senderId]
+        );
+        const prior = priorResult.rows[0];
+        if (prior) {
+          forwardedFrom = prior.id;
+          provenanceRoot = prior.provenance_root_message_id || prior.id;
+          originSenderId = prior.provenance_origin_sender_id || prior.sender_id;
+          forwardDepth = Number(prior.forward_depth || 0) + 1;
+          provenanceKind = "copied_text";
+        }
+      }
+    }
+  }
+
   let verifiedReply = null;
   if (typeof replyTo?.id === "string" && replyTo.id.length <= 50) {
     const replyResult = await client.query(
@@ -143,14 +257,18 @@ async function insertMessage(client, { chatId, senderId, text, replyTo, clientMe
   }
   const result = await client.query(
     `INSERT INTO messages
-       (id, chat_id, sender_id, client_message_id, text, reply_to_id, reply_to_text, reply_to_sender, status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'sent')
+       (id, chat_id, sender_id, client_message_id, text, reply_to_id, reply_to_text,
+        reply_to_sender, status, forwarded_from_message_id, provenance_root_message_id,
+        provenance_origin_sender_id, provenance_kind, forward_depth, content_sha256,
+        safety_status, safety_flags, media_asset_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'sent',$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17)
      ON CONFLICT (sender_id, client_message_id) WHERE client_message_id IS NOT NULL
      DO UPDATE SET client_message_id=EXCLUDED.client_message_id
      RETURNING *, (xmax=0) AS inserted`,
-    [messageId, chatId, senderId, clientMessageId, text.trim(),
+    [messageId, chatId, senderId, clientMessageId, resolvedText,
       verifiedReply?.id || null, verifiedReply?.text?.slice(0, 500) || null,
-      verifiedReply?.username || null]
+      verifiedReply?.username || null, forwardedFrom, provenanceRoot, originSenderId,
+      provenanceKind, forwardDepth, contentHash, safetyStatus, JSON.stringify(safetyFlags), mediaAssetId]
   );
   const msg = result.rows[0];
   if (recipientIds.length > 0) {
@@ -161,14 +279,28 @@ async function insertMessage(client, { chatId, senderId, text, replyTo, clientMe
       [msg.id, recipientIds]
     );
   }
+  if (isTraceableMedia(msg.text)) {
+    const viewers = [...new Set([senderId, ...recipientIds])];
+    for (const viewerId of viewers) {
+      const traceCode = createTraceCode(msg.id, viewerId);
+      await client.query(
+        `INSERT INTO message_trace_deliveries (message_id,recipient_id,trace_code)
+         VALUES ($1,$2,$3)
+         ON CONFLICT (message_id,recipient_id) DO UPDATE SET trace_code=EXCLUDED.trace_code`,
+        [msg.id, viewerId, traceCode]
+      );
+    }
+  }
   await client.query("UPDATE chats SET last_message_at=NOW() WHERE id=$1", [chatId]);
   return msg;
 }
 
 function registerMessageHandlers(io, socket) {
   async function sendDirect(payload = {}, ack) {
-    const { to, text, replyTo } = payload;
-    if (!to || to === socket.userId || !validateText(text)) {
+    const { to, text, replyTo, forwardedFromMessageId } = payload;
+    const validForward = typeof forwardedFromMessageId === "string"
+      && forwardedFromMessageId.length > 0 && forwardedFromMessageId.length <= 50;
+    if (!to || to === socket.userId || (!validForward && !validateText(text))) {
       return acknowledge(ack, { ok: false, error: "Invalid message." });
     }
     const clientMessageId = validClientMessageId(payload.clientMessageId)
@@ -192,7 +324,8 @@ function registerMessageHandlers(io, socket) {
       try {
         await client.query("BEGIN");
         msg = await insertMessage(client, {
-          chatId, senderId: socket.userId, text, replyTo, clientMessageId, recipientIds: [to],
+          chatId, senderId: socket.userId, text, replyTo, clientMessageId,
+          recipientIds: [to], forwardedFromMessageId: validForward ? forwardedFromMessageId : null,
         });
         await client.query("COMMIT");
       } catch (err) {
@@ -219,14 +352,17 @@ function registerMessageHandlers(io, socket) {
       }
     } catch (err) {
       console.error("[message:send]", err.message);
-      acknowledge(ack, { ok: false, error: "Message could not be sent." });
-      socket.emit("message:error", { clientMessageId, error: "Message could not be sent." });
+      const publicError = err.publicMessage || "Message could not be sent.";
+      acknowledge(ack, { ok: false, error: publicError });
+      socket.emit("message:error", { clientMessageId, error: publicError });
     }
   }
 
   async function sendGroup(payload = {}, ack) {
-    const { chatId, text, replyTo } = payload;
-    if (!chatId || !validateText(text)) return acknowledge(ack, { ok: false, error: "Invalid message." });
+    const { chatId, text, replyTo, forwardedFromMessageId } = payload;
+    const validForward = typeof forwardedFromMessageId === "string"
+      && forwardedFromMessageId.length > 0 && forwardedFromMessageId.length <= 50;
+    if (!chatId || (!validForward && !validateText(text))) return acknowledge(ack, { ok: false, error: "Invalid message." });
     const clientMessageId = validClientMessageId(payload.clientMessageId)
       ? payload.clientMessageId
       : `legacy_${randomUUID()}`;
@@ -249,6 +385,7 @@ function registerMessageHandlers(io, socket) {
         await client.query("BEGIN");
         msg = await insertMessage(client, {
           chatId, senderId: socket.userId, text, replyTo, clientMessageId, recipientIds,
+          forwardedFromMessageId: validForward ? forwardedFromMessageId : null,
         });
         await client.query("COMMIT");
       } catch (err) {
@@ -264,7 +401,9 @@ function registerMessageHandlers(io, socket) {
       });
       emitToUser(io, socket.userId, "message:sent", outgoing);
       if (msg.inserted) {
-        for (const userId of recipientIds) emitToUser(io, userId, "message:receive", outgoing);
+        for (const userId of recipientIds) {
+          emitToUser(io, userId, "message:receive", outgoing);
+        }
         await markDelivered(io, msg.id, recipientIds);
       }
       acknowledge(ack, { ok: true, message: outgoing });
@@ -279,8 +418,9 @@ function registerMessageHandlers(io, socket) {
       }
     } catch (err) {
       console.error("[group:message:send]", err.message);
-      acknowledge(ack, { ok: false, error: "Message could not be sent." });
-      socket.emit("message:error", { clientMessageId, error: "Message could not be sent." });
+      const publicError = err.publicMessage || "Message could not be sent.";
+      acknowledge(ack, { ok: false, error: publicError });
+      socket.emit("message:error", { clientMessageId, error: publicError });
     }
   }
 

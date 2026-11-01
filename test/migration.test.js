@@ -12,16 +12,16 @@ test("migrated database contains P0-P4 integrity structures", { skip: process.en
     const tables = await client.query(
       `SELECT table_name FROM information_schema.tables WHERE table_schema='public'
        AND table_name=ANY($1::text[])`,
-      [["schema_migrations", "message_receipts", "booking_slots", "bookings", "ad_events"]]
+      [["schema_migrations", "message_receipts", "booking_slots", "bookings", "ad_events", "media_assets", "message_trace_deliveries", "forensic_access_logs"]]
     );
-    assert.deepEqual(new Set(tables.rows.map((row) => row.table_name)), new Set(["schema_migrations", "message_receipts", "booking_slots", "bookings", "ad_events"]));
+    assert.deepEqual(new Set(tables.rows.map((row) => row.table_name)), new Set(["schema_migrations", "message_receipts", "booking_slots", "bookings", "ad_events", "media_assets", "message_trace_deliveries", "forensic_access_logs"]));
     const indexes = await client.query(
       `SELECT indexname FROM pg_indexes WHERE schemaname='public'
        AND indexname=ANY($1::text[])`, [["uq_chats_direct_key", "uq_bookings_active_slot", "idx_businesses_discovery"]]
     );
     assert.equal(indexes.rows.length, 3);
     const migrations = await client.query("SELECT COUNT(*)::int AS count FROM schema_migrations");
-    assert.ok(migrations.rows[0].count >= 9);
+    assert.ok(migrations.rows[0].count >= 13);
     const businessColumns = await client.query(
       `SELECT column_name FROM information_schema.columns WHERE table_schema='public'
        AND table_name='businesses' AND column_name=ANY($1::text[])`,
@@ -40,5 +40,11 @@ test("migrated database contains P0-P4 integrity structures", { skip: process.en
       [["fulfillment_type", "service_address"]]
     );
     assert.equal(bookingColumns.rows.length, 2);
+    const messageColumns = await client.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_schema='public'
+       AND table_name='messages' AND column_name=ANY($1::text[])`,
+      [["forwarded_from_message_id", "provenance_root_message_id", "provenance_origin_sender_id", "provenance_kind", "forward_depth", "content_sha256", "safety_status", "safety_flags", "media_asset_id"]]
+    );
+    assert.equal(messageColumns.rows.length, 9);
   } finally { await client.end(); }
 });
