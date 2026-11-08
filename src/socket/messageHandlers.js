@@ -1,7 +1,7 @@
 const { randomUUID } = require("crypto");
 const pool = require("../db/pool");
 const { getOrCreateDirectChat } = require("../db/queries");
-const { sendPushNotification } = require("../services/push");
+const { sendPushToDeviceTokens } = require("../services/push");
 const { emitToUser, isUserOnline } = require("./realtime");
 const { assessMessageSafety, extractUrls, parseMediaReference, sha256 } = require("../utils/contentSafety");
 const { createTraceCode, isTraceableMedia } = require("../services/mediaTrace");
@@ -56,10 +56,10 @@ function messagePayload(msg, extras = {}) {
 async function pushToUser(userId, data) {
   try {
     const result = await pool.query(
-      "SELECT push_token FROM device_tokens WHERE user_id=$1 AND provider='expo' ORDER BY updated_at DESC",
+      "SELECT push_token, provider FROM device_tokens WHERE user_id=$1 AND provider IN ('fcm','expo') ORDER BY updated_at DESC",
       [userId]
     );
-    await Promise.all(result.rows.map((row) => sendPushNotification(row.push_token, data)));
+    await sendPushToDeviceTokens(result.rows, data);
   } catch (err) {
     console.error("[push]", err.message);
   }

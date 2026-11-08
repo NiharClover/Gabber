@@ -1,6 +1,6 @@
 const { randomUUID } = require("crypto");
 const pool = require("../db/pool");
-const { sendPushNotification } = require("../services/push");
+const { sendPushToDeviceTokens } = require("../services/push");
 const { emitToUser, isUserOnline, userRoom } = require("./realtime");
 
 const calls = new Map();
@@ -14,10 +14,10 @@ const MAX_GROUP_CALL_PARTICIPANTS = 6;
 async function pushGroupCallInvitation(userId, payload) {
   try {
     const result = await pool.query(
-      "SELECT push_token FROM device_tokens WHERE user_id=$1 AND provider='expo' ORDER BY updated_at DESC",
+      "SELECT push_token, provider FROM device_tokens WHERE user_id=$1 AND provider IN ('fcm','expo') ORDER BY updated_at DESC",
       [userId]
     );
-    await Promise.all(result.rows.map((row) => sendPushNotification(row.push_token, payload)));
+    await sendPushToDeviceTokens(result.rows, payload);
   } catch (err) {
     console.error("[group-call:push]", err.message);
   }
