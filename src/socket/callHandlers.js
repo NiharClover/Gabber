@@ -31,8 +31,43 @@ function clearSession(session) {
   if (callByUser.get(session.callee) === session.id) callByUser.delete(session.callee);
 }
 
+async function recordCallStarted(session) {
+  try {
+    await pool.query(
+      `INSERT INTO call_history (id, caller_id, callee_id, call_type, status, started_at)
+       VALUES ($1,$2,$3,$4,'ringing',TO_TIMESTAMP($5 / 1000.0))
+       ON CONFLICT (id) DO NOTHING`,
+      [session.id, session.caller, session.callee, session.callType, session.createdAt]
+    );
+  } catch (err) {
+    console.error("[call:history:start]", err.message);
+  }
+}
+
+function updateCallHistory(io, session, status, answered = false) {
+  const answeredSql = answered ? ", answered_at=COALESCE(answered_at,NOW())" : "";
+  const endedSql = ["completed", "missed", "rejected", "cancelled"].includes(status) ? ", ended_at=NOW()" : "";
+  pool.query(
+    `UPDATE call_history SET status=$2${answeredSql}${endedSql} WHERE id=$1`,
+    [session.id, status]
+  )
+    .catch((err) => console.error("[call:history:update]", err.message))
+    .finally(() => {
+      // Refresh clients only after the database write has settled. Emitting
+      // before this point can make the Calls screen reload the old status.
+      emitToUser(io, session.caller, "call:history:updated", { callId: session.id });
+      emitToUser(io, session.callee, "call:history:updated", { callId: session.id });
+    });
+}
+
 function endSession(io, session, endedBy, reason = "ended") {
   const peer = otherUser(session, endedBy);
+  const finalStatus = session.state === "connected"
+    ? "completed"
+    : reason === "no_answer"
+      ? "missed"
+      : endedBy === session.caller ? "cancelled" : "rejected";
+  updateCallHistory(io, session, finalStatus);
   emitToUser(io, peer, "call:ended", { callId: session.id, from: endedBy, reason });
   emitToUser(io, endedBy, "call:ended:ack", { callId: session.id, reason });
   clearSession(session);
@@ -40,12 +75,27 @@ function endSession(io, session, endedBy, reason = "ended") {
 
 function endGroupCall(io, session, reason = "ended") {
   clearTimeout(session.lifecycleTimer);
+  clearTimeout(session.photoMoment?.timeout);
   for (const userId of session.participants) {
     emitToUser(io, userId, "group-call:ended", { roomId: session.id, reason });
     if (callByUser.get(userId) === session.id) callByUser.delete(userId);
   }
   session.participants.clear();
   groupCalls.delete(session.id);
+}
+
+function cancelGroupPhotoMoment(io, session, message) {
+  const moment = session?.photoMoment;
+  if (!moment) return;
+  clearTimeout(moment.timeout);
+  session.photoMoment = null;
+  for (const userId of moment.participants) {
+    emitToUser(io, userId, "group-call:photo-cancelled", {
+      roomId: session.id,
+      requestId: moment.id,
+      message,
+    });
+  }
 }
 
 function relayOrQueue(io, session, recipientId, event, payload) {
@@ -82,7 +132,7 @@ function registerCallHandlers(io, socket) {
       if (!result.rows.length) return acknowledge(ack, { ok: false, error: "Group not found or access denied." });
       const roomId = `gcall_${randomUUID()}`;
       const members = new Map(result.rows.map((row) => [row.user_id, row.username]));
-      const session = { id: roomId, chatId, groupName: result.rows[0].name, callType, creator: socket.userId, members, participants: new Set(), createdAt: Date.now(), lifecycleTimer: null };
+      const session = { id: roomId, chatId, groupName: result.rows[0].name, callType, creator: socket.userId, members, participants: new Set(), createdAt: Date.now(), lifecycleTimer: null, photoMoment: null };
       groupCalls.set(roomId, session);
       session.lifecycleTimer = setTimeout(() => {
         if (groupCalls.get(roomId) === session && !session.participants.has(session.creator)) endGroupCall(io, session, "host_unavailable");
@@ -107,6 +157,7 @@ function registerCallHandlers(io, socket) {
     const activeCall = callByUser.get(socket.userId);
     if (activeCall && activeCall !== roomId) return acknowledge(ack, { ok: false, error: "You are already in another call." });
     if (session.participants.size >= MAX_GROUP_CALL_PARTICIPANTS && !session.participants.has(socket.userId)) return acknowledge(ack, { ok: false, error: "Group call is full." });
+    if (!session.participants.has(socket.userId)) cancelGroupPhotoMoment(io, session, "The photo was cancelled because the participant list changed.");
     const participants = [...session.participants].map((userId) => ({ userId, username: session.members.get(userId) || "Participant" }));
     session.participants.add(socket.userId);
     callByUser.set(socket.userId, roomId);
@@ -130,6 +181,74 @@ function registerCallHandlers(io, socket) {
       acknowledge(ack, { ok: true });
     });
   }
+
+  socket.on("group-call:photo-request", ({ roomId } = {}, ack) => {
+    const session = groupCalls.get(roomId);
+    if (!session?.participants.has(socket.userId)) return acknowledge(ack, { ok: false, error: "Group call not found." });
+    if (session.callType !== "video") return acknowledge(ack, { ok: false, error: "Group photos are available in video calls." });
+    if (session.participants.size < 2) return acknowledge(ack, { ok: false, error: "Wait for at least one other participant." });
+    if (session.photoMoment) return acknowledge(ack, { ok: false, error: "A group photo request is already active." });
+
+    const requestId = `photo_${randomUUID()}`;
+    const participants = new Set(session.participants);
+    const moment = {
+      id: requestId,
+      requester: socket.userId,
+      participants,
+      accepted: new Set([socket.userId]),
+      timeout: null,
+    };
+    session.photoMoment = moment;
+    moment.timeout = setTimeout(() => {
+      if (session.photoMoment === moment) cancelGroupPhotoMoment(io, session, "The photo request expired before everyone responded.");
+    }, 30000);
+
+    for (const userId of participants) {
+      if (userId !== socket.userId) {
+        emitToUser(io, userId, "group-call:photo-request", {
+          roomId,
+          requestId,
+          from: socket.userId,
+          fromName: session.members.get(socket.userId) || socket.username,
+        });
+      }
+    }
+    acknowledge(ack, { ok: true, requestId, totalCount: participants.size });
+  });
+
+  socket.on("group-call:photo-response", ({ roomId, requestId, approved } = {}, ack) => {
+    const session = groupCalls.get(roomId);
+    const moment = session?.photoMoment;
+    if (!moment || moment.id !== requestId || !moment.participants.has(socket.userId) || socket.userId === moment.requester || typeof approved !== "boolean") {
+      return acknowledge(ack, { ok: false, error: "Photo request is no longer active." });
+    }
+    if (!approved) {
+      const username = session.members.get(socket.userId) || "A participant";
+      cancelGroupPhotoMoment(io, session, `${username} chose not to join the photo.`);
+      return acknowledge(ack, { ok: true });
+    }
+
+    moment.accepted.add(socket.userId);
+    emitToUser(io, moment.requester, "group-call:photo-progress", {
+      roomId,
+      requestId,
+      acceptedCount: moment.accepted.size,
+      totalCount: moment.participants.size,
+    });
+
+    if (moment.accepted.size === moment.participants.size) {
+      clearTimeout(moment.timeout);
+      session.photoMoment = null;
+      for (const userId of moment.participants) {
+        emitToUser(io, userId, "group-call:photo-countdown", {
+          roomId,
+          requestId,
+          countdownSeconds: 3,
+        });
+      }
+    }
+    acknowledge(ack, { ok: true });
+  });
 
   socket.on("group-call:leave", ({ roomId } = {}, ack) => {
     leaveGroupCall(io, socket.userId, roomId);
@@ -186,6 +305,7 @@ function registerCallHandlers(io, socket) {
       calls.set(callId, session);
       callByUser.set(socket.userId, callId);
       callByUser.set(to, callId);
+      await recordCallStarted(session);
       session.lifecycleTimer = setTimeout(() => {
         if (calls.get(callId) === session && session.state !== "connected") {
           endSession(io, session, session.caller, "no_answer");
@@ -231,6 +351,7 @@ function registerCallHandlers(io, socket) {
       return acknowledge(ack, { ok: false, error: "Invalid call answer." });
     }
     session.state = "connected";
+    updateCallHistory(io, session, "connected", true);
     clearTimeout(session.lifecycleTimer);
     session.lifecycleTimer = null;
     socket.to(userRoom(session.callee)).emit("call:taken", { callId: session.id });
@@ -285,6 +406,7 @@ function registerCallHandlers(io, socket) {
     const session = getSession(callId, socket.userId);
     if (!session) return acknowledge(ack, { ok: false, error: "Call not found." });
     const peer = otherUser(session, socket.userId);
+    updateCallHistory(io, session, "rejected");
     emitToUser(io, peer, "call:rejected", { callId: session.id, from: socket.userId });
     clearSession(session);
     acknowledge(ack, { ok: true });
@@ -396,6 +518,7 @@ function leaveGroupCall(io, userId, roomId) {
     return;
   }
   if (!session?.participants.has(userId)) return;
+  cancelGroupPhotoMoment(io, session, "The photo was cancelled because a participant left the call.");
   session.participants.delete(userId);
   if (callByUser.get(userId) === roomId) callByUser.delete(userId);
   for (const peerId of session.participants) emitToUser(io, peerId, "group-call:participant-left", { roomId, userId });

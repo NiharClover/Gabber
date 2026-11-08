@@ -24,6 +24,8 @@ const ordersRouter = require("./routes/orders");
 const adsRouter = require("./routes/ads");
 const discoveryRouter = require("./routes/discovery");
 const bookingsRouter = require("./routes/bookings");
+const aiImagesRouter = require("./routes/aiImages");
+const callsRouter = require("./routes/calls");
 const { registerHandlers } = require("./socket/handlers");
 const { verifySocketToken } = require("./middleware/auth");
 const { startCleanupScheduler } = require("./services/cleanup");
@@ -69,6 +71,7 @@ const adminRouter = require("./routes/admin");
 // Set to "false" in .env to temporarily disable business features
 // (routes + registration) without deleting any code.
 const BUSINESS_ENABLED = process.env.FEATURE_BUSINESS_ENABLED !== "false";
+const AI_IMAGES_ENABLED = process.env.FEATURE_AI_IMAGES_ENABLED === "true";
 
 
 
@@ -105,9 +108,15 @@ app.use("/api/stickers", stickersRouter);
 app.use("/api/devices", devicesRouter);
 app.use("/api/contacts", contactsRouter);
 app.use("/api/media", mediaRouter);
+if (AI_IMAGES_ENABLED) {
+  app.use("/api/ai-images", aiImagesRouter);
+} else {
+  console.log("[server] AI image generation disabled (FEATURE_AI_IMAGES_ENABLED is not true)");
+}
 app.use("/api/voice", voiceRouter);
 app.use("/api/status", statusRouter);
 app.use("/api/profile", profileRouter);
+app.use("/api/calls", callsRouter);
 if (BUSINESS_ENABLED) {
   app.use("/api/business", businessRouter);
   app.use("/api/orders", ordersRouter);

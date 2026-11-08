@@ -18,6 +18,19 @@ function validateText(text) {
   return typeof text === "string" && text.trim().length > 0 && text.length <= 20000;
 }
 
+function replyPreviewText(text) {
+  if (!text) return "Message";
+  if (text.startsWith("[image]")) return "Photo";
+  if (text.startsWith("[view-once]")) return "View-once photo";
+  if (text.startsWith("[voice]")) return "Voice message";
+  if (text.startsWith("[sticker]")) return "Sticker";
+  if (text.startsWith("[payment]")) return "Payment";
+  if (text.startsWith("[payment-request]")) return "Payment request";
+  if (text.startsWith("[bill]")) return "Order";
+  if (text.startsWith("[booking]")) return "Booking";
+  return text.slice(0, 500);
+}
+
 function messagePayload(msg, extras = {}) {
   return {
     id: msg.id,
@@ -266,7 +279,7 @@ async function insertMessage(client, {
      DO UPDATE SET client_message_id=EXCLUDED.client_message_id
      RETURNING *, (xmax=0) AS inserted`,
     [messageId, chatId, senderId, clientMessageId, resolvedText,
-      verifiedReply?.id || null, verifiedReply?.text?.slice(0, 500) || null,
+      verifiedReply?.id || null, verifiedReply ? replyPreviewText(verifiedReply.text) : null,
       verifiedReply?.username || null, forwardedFrom, provenanceRoot, originSenderId,
       provenanceKind, forwardDepth, contentHash, safetyStatus, JSON.stringify(safetyFlags), mediaAssetId]
   );
