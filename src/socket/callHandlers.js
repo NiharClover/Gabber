@@ -1,5 +1,6 @@
 const { randomUUID } = require("crypto");
 const pool = require("../db/pool");
+const { sendPushNotification } = require("../services/push");
 const { emitToUser, isUserOnline, userRoom } = require("./realtime");
 
 const calls = new Map();
@@ -9,6 +10,18 @@ const startingUsers = new Set();
 const RECONNECT_GRACE_MS = 15000;
 const SCREENSHOT_GRANT_MS = 60000;
 const MAX_GROUP_CALL_PARTICIPANTS = 6;
+
+async function pushGroupCallInvitation(userId, payload) {
+  try {
+    const result = await pool.query(
+      "SELECT push_token FROM device_tokens WHERE user_id=$1 AND provider='expo' ORDER BY updated_at DESC",
+      [userId]
+    );
+    await Promise.all(result.rows.map((row) => sendPushNotification(row.push_token, payload)));
+  } catch (err) {
+    console.error("[group-call:push]", err.message);
+  }
+}
 
 function acknowledge(ack, payload) {
   if (typeof ack === "function") ack(payload);
@@ -138,9 +151,16 @@ function registerCallHandlers(io, socket) {
         if (groupCalls.get(roomId) === session && !session.participants.has(session.creator)) endGroupCall(io, session, "host_unavailable");
       }, 60000);
       for (const [userId] of members) {
-        if (userId !== socket.userId && isUserOnline(io, userId) && !callByUser.has(userId)) {
-          emitToUser(io, userId, "group-call:incoming", { roomId, chatId, groupName: session.groupName, callType, from: socket.userId, fromName: socket.username });
-        }
+        if (userId === socket.userId || callByUser.has(userId)) continue;
+        const invitation = { roomId, chatId, groupName: session.groupName, callType, from: socket.userId, fromName: socket.username };
+        if (isUserOnline(io, userId)) emitToUser(io, userId, "group-call:incoming", invitation);
+        // Android and iOS can suspend a seemingly-online socket as soon as the
+        // app is backgrounded, so every eligible participant also gets push.
+        void pushGroupCallInvitation(userId, {
+          ...invitation,
+          type: callType === "video" ? "group_video_call" : "group_call",
+          senderName: socket.username,
+        });
       }
       acknowledge(ack, { ok: true, roomId, groupName: session.groupName });
     } catch (err) {

@@ -7,7 +7,7 @@ async function sendPushNotification(pushToken, data) {
     return;
   }
 
-  const { type, senderName, text, chatId, otherUserId, groupName } = data;
+  const { type, senderName, text, chatId, otherUserId, groupName, roomId, callType, from, fromName } = data;
 
   let title = "";
   let body = "";
@@ -36,18 +36,25 @@ async function sendPushNotification(pushToken, data) {
   } else if (type === "video_call") {
     title = "📹 Incoming Video Call";
     body = `${senderName} wants to video call`;
+  } else if (type === "group_call" || type === "group_video_call") {
+    title = type === "group_video_call" ? "Incoming Group Video Call" : "Incoming Group Call";
+    body = `${fromName || senderName || "Someone"} is calling ${groupName || "your group"}`;
   }
+
+  if (!title) return;
+
+  const isCall = ["call", "video_call", "group_call", "group_video_call"].includes(type);
 
   const message = {
     to: pushToken,
     sound: "default",
     title,
     body,
-    data: { chatId, otherUserId, type, senderName },
+    data: { chatId, otherUserId, type, senderName, groupName, roomId, callType, from, fromName },
     priority: "high",
-    channelId: "messages",
+    channelId: isCall ? "calls" : "messages",
     badge: 1,
-    ttl: 3600,
+    ttl: isCall ? 120 : 3600,
   };
 
   try {
