@@ -26,6 +26,7 @@ const discoveryRouter = require("./routes/discovery");
 const bookingsRouter = require("./routes/bookings");
 const aiImagesRouter = require("./routes/aiImages");
 const callsRouter = require("./routes/calls");
+const appUpdateRouter = require("./routes/appUpdate");
 const { registerHandlers } = require("./socket/handlers");
 const { verifySocketToken } = require("./middleware/auth");
 const { startCleanupScheduler } = require("./services/cleanup");
@@ -101,6 +102,7 @@ app.use(express.json({ limit: "2mb" }));
 
 app.use("/uploads", express.static(path.join(__dirname, "../uploads")));
 app.use("/api", healthRouter);
+app.use("/api/app-update", appUpdateRouter);
 app.use("/api/auth", authRouter);
 app.use("/api/chats", chatsRouter);
 app.use("/api/groups", groupsRouter);

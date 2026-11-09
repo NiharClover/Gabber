@@ -6,15 +6,16 @@ const expo = new Expo();
 let firebaseApp = null;
 
 function buildPushContent(data = {}) {
-  const { type, senderName, text, groupName, fromName } = data;
+  const { type, senderName, text, groupName, fromName, hideSenderName } = data;
   let title = "";
   let body = "";
 
   if (type === "message") {
-    title = senderName || "New message";
+    title = hideSenderName ? "New message" : (senderName || "New message");
     if (text?.startsWith("[image]")) body = "Sent a photo";
     else if (text?.startsWith("[view-once]")) body = "Sent a view-once photo";
     else if (text?.startsWith("[voice]")) body = "Sent a voice message";
+    else if (text?.startsWith("[document]")) body = "Sent a PDF document";
     else if (text?.startsWith("[payment-status-v2]")) body = "Payment status updated";
     else if (text?.startsWith("[payment-v2]") || text?.startsWith("[payment]")) body = "Payment initiated";
     else if (text?.startsWith("[payment-request-v2]") || text?.startsWith("[payment-request]")) body = "Payment requested";
@@ -25,9 +26,10 @@ function buildPushContent(data = {}) {
     title = groupName || "Group message";
     const preview = text?.startsWith("[image]") ? "Photo"
       : text?.startsWith("[voice]") ? "Voice message"
+      : text?.startsWith("[document]") ? "PDF document"
       : text?.startsWith("[sticker]") ? "Sticker"
       : text || "New message";
-    body = `${senderName || "Someone"}: ${preview}`;
+    body = hideSenderName ? preview : `${senderName || "Someone"}: ${preview}`;
   } else if (type === "call") {
     title = "Incoming Call";
     body = `${senderName || "Someone"} is calling you`;
@@ -45,7 +47,10 @@ function buildPushContent(data = {}) {
 }
 
 function pushData(data = {}) {
-  const allowed = ["chatId", "otherUserId", "type", "senderName", "groupName", "roomId", "callType", "from", "fromName"];
+  // `from` is reserved by FCM and causes the entire native notification to
+  // be rejected with messaging/invalid-argument. `fromName` and the call/chat
+  // identifiers contain everything the app needs to open the destination.
+  const allowed = ["chatId", "otherUserId", "type", "senderName", "groupName", "roomId", "callType", "fromName", "categoryId"];
   return Object.fromEntries(allowed
     .filter((key) => data[key] !== undefined && data[key] !== null)
     .map((key) => [key, String(data[key])]));
@@ -76,6 +81,7 @@ async function sendExpoPushNotification(pushToken, data) {
     data: pushData(data),
     priority: "high",
     channelId: content.isCall ? "calls" : "messages",
+    ...(data.categoryId ? { categoryId: data.categoryId } : {}),
     badge: 1,
     ttl: content.isCall ? 120 : 3600,
   };
@@ -103,20 +109,40 @@ async function sendFcmPushNotification(pushToken, data) {
   const content = buildPushContent(data);
   if (!content) return false;
   try {
-    await firebaseMessaging().send({
-      token: pushToken,
-      notification: { title: content.title, body: content.body },
-      data: pushData(data),
-      android: {
-        priority: "high",
-        ttl: (content.isCall ? 120 : 3600) * 1000,
-        notification: {
-          channelId: content.isCall ? "calls" : "messages",
-          sound: "default",
-          defaultVibrateTimings: true,
-        },
-      },
-    });
+    const appData = pushData(data);
+    const message = content.isCall
+      ? {
+          token: pushToken,
+          notification: { title: content.title, body: content.body },
+          data: appData,
+          android: {
+            priority: "high",
+            ttl: 120 * 1000,
+            notification: {
+              channelId: "calls",
+              sound: "default",
+              defaultVibrateTimings: true,
+            },
+          },
+        }
+      : {
+          // Notification messages are rendered directly by Android while the
+          // app is backgrounded, bypassing expo-notifications categories and
+          // therefore dropping Reply/Mark-as-read actions. A high-priority
+          // data message is rendered by expo-notifications and retains them.
+          token: pushToken,
+          data: {
+            ...appData,
+            title: content.title,
+            message: content.body,
+            body: JSON.stringify(appData),
+            sound: "default",
+            vibrate: "true",
+            channelId: "messages",
+          },
+          android: { priority: "high", ttl: 3600 * 1000 },
+        };
+    await firebaseMessaging().send(message);
     return true;
   } catch (err) {
     console.error("[push:fcm]", err.code || err.message, err.message);
@@ -146,6 +172,7 @@ async function sendPushToDeviceTokens(tokenRows, data) {
 
 module.exports = {
   buildPushContent,
+  pushData,
   sendExpoPushNotification,
   sendFcmPushNotification,
   sendPushNotification,

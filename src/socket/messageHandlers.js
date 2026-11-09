@@ -23,6 +23,7 @@ function replyPreviewText(text) {
   if (text.startsWith("[image]")) return "Photo";
   if (text.startsWith("[view-once]")) return "View-once photo";
   if (text.startsWith("[voice]")) return "Voice message";
+  if (text.startsWith("[document]")) return "Document";
   if (text.startsWith("[sticker]")) return "Sticker";
   if (text.startsWith("[payment]")) return "Payment";
   if (text.startsWith("[payment-request]")) return "Payment request";
@@ -56,10 +57,19 @@ function messagePayload(msg, extras = {}) {
 async function pushToUser(userId, data) {
   try {
     const result = await pool.query(
-      "SELECT push_token, provider FROM device_tokens WHERE user_id=$1 AND provider IN ('fcm','expo') ORDER BY updated_at DESC",
+      `SELECT dt.push_token, dt.provider,
+              COALESCE(np.hide_sender_name, FALSE) AS hide_sender_name
+       FROM device_tokens dt
+       LEFT JOIN notification_preferences np ON np.user_id=dt.user_id
+       WHERE dt.user_id=$1 AND dt.provider IN ('fcm','expo')
+       ORDER BY dt.updated_at DESC`,
       [userId]
     );
-    await sendPushToDeviceTokens(result.rows, data);
+    await sendPushToDeviceTokens(result.rows, {
+      ...data,
+      hideSenderName: result.rows[0]?.hide_sender_name === true,
+      categoryId: ["message", "group_message"].includes(data.type) ? "message_actions" : undefined,
+    });
   } catch (err) {
     console.error("[push]", err.message);
   }
@@ -308,6 +318,79 @@ async function insertMessage(client, {
   return msg;
 }
 
+async function sendMessageInChat(io, { chatId, senderId, text, clientMessageId }) {
+  if (!chatId || !validateText(text)) {
+    throw Object.assign(new Error("Invalid message."), { status: 400 });
+  }
+  const chatResult = await pool.query(
+    `SELECT c.type, c.name
+     FROM chats c
+     JOIN chat_members cm ON cm.chat_id=c.id AND cm.user_id=$2
+     WHERE c.id=$1`,
+    [chatId, senderId]
+  );
+  const chat = chatResult.rows[0];
+  if (!chat) throw Object.assign(new Error("Not a chat member."), { status: 403 });
+
+  const members = await pool.query(
+    "SELECT user_id FROM chat_members WHERE chat_id=$1 AND user_id!=$2",
+    [chatId, senderId]
+  );
+  const recipientIds = members.rows.map((row) => row.user_id);
+  if (chat.type === "direct" && recipientIds[0]) {
+    const blocked = await pool.query(
+      `SELECT 1 FROM blocked_users
+       WHERE (blocker_id=$1 AND blocked_id=$2) OR (blocker_id=$2 AND blocked_id=$1)`,
+      [senderId, recipientIds[0]]
+    );
+    if (blocked.rows[0]) throw Object.assign(new Error("Cannot send message."), { status: 403 });
+  }
+
+  const resolvedClientMessageId = validClientMessageId(clientMessageId)
+    ? clientMessageId
+    : `notification_${randomUUID()}`;
+  const client = await pool.connect();
+  let msg;
+  try {
+    await client.query("BEGIN");
+    msg = await insertMessage(client, {
+      chatId,
+      senderId,
+      text,
+      clientMessageId: resolvedClientMessageId,
+      recipientIds,
+    });
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  const sender = await pool.query("SELECT username FROM users WHERE id=$1", [senderId]);
+  const outgoing = messagePayload(msg, {
+    ...(chat.type === "group" ? { isGroup: true } : { to: recipientIds[0] }),
+    sender_name: sender.rows[0]?.username,
+  });
+  emitToUser(io, senderId, "message:sent", outgoing);
+  if (msg.inserted) {
+    for (const userId of recipientIds) emitToUser(io, userId, "message:receive", outgoing);
+    await markDelivered(io, msg.id, recipientIds);
+    for (const userId of recipientIds) {
+      await pushToUser(userId, {
+        type: chat.type === "group" ? "group_message" : "message",
+        senderName: sender.rows[0]?.username,
+        text: msg.text,
+        chatId,
+        otherUserId: senderId,
+        ...(chat.type === "group" ? { groupName: chat.name } : {}),
+      });
+    }
+  }
+  return outgoing;
+}
+
 function registerMessageHandlers(io, socket) {
   async function sendDirect(payload = {}, ack) {
     const { to, text, replyTo, forwardedFromMessageId } = payload;
@@ -450,11 +533,13 @@ function registerMessageHandlers(io, socket) {
 
       const changed = await pool.query(
         `INSERT INTO message_receipts (message_id, user_id, status)
-         SELECT m.id, $2, 'read'
+         SELECT m.id, $2::varchar, 'read'
          FROM messages m
-         WHERE m.chat_id=$1 AND m.sender_id!=$2
+         WHERE m.chat_id=$1 AND m.sender_id!=$2::varchar
          ON CONFLICT (message_id, user_id) DO UPDATE
-         SET status='read'
+         SET status='read',
+             delivered_at=COALESCE(message_receipts.delivered_at, NOW()),
+             read_at=COALESCE(message_receipts.read_at, NOW())
          RETURNING message_id`,
         [chatId, socket.userId]
       );
@@ -528,4 +613,9 @@ async function reconcileUserMessages(io, userId) {
   }
 }
 
-module.exports = { registerMessageHandlers, reconcileUserMessages };
+module.exports = {
+  registerMessageHandlers,
+  reconcileUserMessages,
+  deriveAndNotifyStatuses,
+  sendMessageInChat,
+};

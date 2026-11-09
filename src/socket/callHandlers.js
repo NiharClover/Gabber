@@ -17,9 +17,42 @@ async function pushGroupCallInvitation(userId, payload) {
       "SELECT push_token, provider FROM device_tokens WHERE user_id=$1 AND provider IN ('fcm','expo') ORDER BY updated_at DESC",
       [userId]
     );
-    await sendPushToDeviceTokens(result.rows, payload);
+    if (!result.rows.length) {
+      console.warn(`[group-call:invite] user=${userId} push=unavailable reason=no_device_token`);
+      return false;
+    }
+    const sent = await sendPushToDeviceTokens(result.rows, payload);
+    console.log(`[group-call:invite] user=${userId} push=${sent ? "accepted" : "failed"} tokens=${result.rows.length}`);
+    return sent;
   } catch (err) {
     console.error("[group-call:push]", err.message);
+    return false;
+  }
+}
+
+function groupCallInvitation(session, from, fromName) {
+  return {
+    roomId: session.id,
+    chatId: session.chatId,
+    groupName: session.groupName,
+    callType: session.callType,
+    from,
+    fromName,
+  };
+}
+
+function deliverPendingGroupCallInvitations(socket) {
+  for (const session of groupCalls.values()) {
+    if (session.creator === socket.userId ||
+        !session.members.has(socket.userId) ||
+        session.participants.has(socket.userId) ||
+        callByUser.has(socket.userId)) continue;
+
+    socket.emit(
+      "group-call:incoming",
+      groupCallInvitation(session, session.creator, session.creatorName)
+    );
+    console.log(`[group-call:invite] room=${session.id} user=${socket.userId} socket=resent_on_connect`);
   }
 }
 
@@ -145,15 +178,16 @@ function registerCallHandlers(io, socket) {
       if (!result.rows.length) return acknowledge(ack, { ok: false, error: "Group not found or access denied." });
       const roomId = `gcall_${randomUUID()}`;
       const members = new Map(result.rows.map((row) => [row.user_id, row.username]));
-      const session = { id: roomId, chatId, groupName: result.rows[0].name, callType, creator: socket.userId, members, participants: new Set(), createdAt: Date.now(), lifecycleTimer: null, photoMoment: null };
+      const session = { id: roomId, chatId, groupName: result.rows[0].name, callType, creator: socket.userId, creatorName: socket.username, members, participants: new Set(), createdAt: Date.now(), lifecycleTimer: null, photoMoment: null };
       groupCalls.set(roomId, session);
       session.lifecycleTimer = setTimeout(() => {
         if (groupCalls.get(roomId) === session && !session.participants.has(session.creator)) endGroupCall(io, session, "host_unavailable");
       }, 60000);
       for (const [userId] of members) {
         if (userId === socket.userId || callByUser.has(userId)) continue;
-        const invitation = { roomId, chatId, groupName: session.groupName, callType, from: socket.userId, fromName: socket.username };
-        if (isUserOnline(io, userId)) emitToUser(io, userId, "group-call:incoming", invitation);
+        const invitation = groupCallInvitation(session, socket.userId, socket.username);
+        const socketDelivered = emitToUser(io, userId, "group-call:incoming", invitation);
+        console.log(`[group-call:invite] room=${roomId} user=${userId} socket=${socketDelivered ? "delivered" : "offline"}`);
         // Android and iOS can suspend a seemingly-online socket as soon as the
         // app is backgrounded, so every eligible participant also gets push.
         void pushGroupCallInvitation(userId, {
@@ -274,6 +308,10 @@ function registerCallHandlers(io, socket) {
     leaveGroupCall(io, socket.userId, roomId);
     acknowledge(ack, { ok: true });
   });
+
+  // An invitation may have been emitted while this device's socket was
+  // reconnecting. Re-deliver every still-active invitation to the new socket.
+  setImmediate(() => deliverPendingGroupCallInvitations(socket));
 
   socket.on("call:start", async ({ to, callType } = {}, ack) => {
     if (!to || to === socket.userId || !["voice", "video"].includes(callType)) {

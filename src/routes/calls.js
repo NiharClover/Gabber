@@ -1,9 +1,45 @@
 const express = require("express");
+const crypto = require("crypto");
 const { requireAuth } = require("../middleware/auth");
 const pool = require("../db/pool");
 
 const router = express.Router();
 router.use(requireAuth);
+
+// Coturn's REST authentication scheme creates a short-lived username and
+// HMAC credential. The shared secret stays on the server and is never shipped
+// in the APK.
+router.get("/ice-servers", (req, res) => {
+  const secret = process.env.TURN_SHARED_SECRET;
+  const host = process.env.TURN_HOST;
+  if (!secret || !host) {
+    return res.status(503).json({ error: "Call relay is not configured." });
+  }
+
+  const expiresAtSeconds = Math.floor(Date.now() / 1000) + 60 * 60;
+  const username = `${expiresAtSeconds}:${req.user.userId}`;
+  const credential = crypto
+    .createHmac("sha1", secret)
+    .update(username)
+    .digest("base64");
+
+  res.set("Cache-Control", "no-store");
+  res.json({
+    iceServers: [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+      {
+        urls: [
+          `turn:${host}:3478?transport=udp`,
+          `turn:${host}:3478?transport=tcp`,
+        ],
+        username,
+        credential,
+      },
+    ],
+    expiresAt: expiresAtSeconds * 1000,
+  });
+});
 
 router.get("/", async (req, res) => {
   const userId = req.user.userId;

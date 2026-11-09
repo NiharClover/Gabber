@@ -39,4 +39,36 @@ router.post("/register", async (req, res) => {
   }
 });
 
+router.get("/notification-preferences", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT hide_sender_name FROM notification_preferences WHERE user_id=$1",
+      [req.user.userId]
+    );
+    res.json({ hideSenderName: result.rows[0]?.hide_sender_name === true });
+  } catch (err) {
+    console.error("[devices:notification-preferences]", err.message);
+    res.status(500).json({ error: "Could not load notification preferences." });
+  }
+});
+
+router.put("/notification-preferences", async (req, res) => {
+  if (typeof req.body.hideSenderName !== "boolean") {
+    return res.status(400).json({ error: "hideSenderName must be a boolean." });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO notification_preferences (user_id, hide_sender_name, updated_at)
+       VALUES ($1,$2,NOW())
+       ON CONFLICT (user_id) DO UPDATE
+       SET hide_sender_name=EXCLUDED.hide_sender_name, updated_at=NOW()`,
+      [req.user.userId, req.body.hideSenderName]
+    );
+    res.json({ hideSenderName: req.body.hideSenderName });
+  } catch (err) {
+    console.error("[devices:notification-preferences]", err.message);
+    res.status(500).json({ error: "Could not save notification preferences." });
+  }
+});
+
 module.exports = router;

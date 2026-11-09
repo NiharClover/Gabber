@@ -52,6 +52,15 @@ const upload = multer({
   },
 });
 
+const documentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === "application/pdf") cb(null, true);
+    else cb(new Error("Only PDF documents are allowed."));
+  },
+});
+
 // POST /api/media/upload
 router.post("/upload", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded." });
@@ -108,6 +117,35 @@ router.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
+// POST /api/media/document — PDF chat attachment (20 MB maximum)
+router.post("/document", documentUpload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No PDF uploaded." });
+  try {
+    const filename = `${Date.now()}_${randomUUID().split("-")[0]}.pdf`;
+    const originalName = String(req.file.originalname || "Document.pdf")
+      .replace(/[\r\n|]/g, "_")
+      .slice(0, 180);
+    const url = await uploadBuffer(
+      req.file.buffer,
+      "documents",
+      filename,
+      "application/pdf",
+      req
+    );
+    res.json({
+      success: true,
+      url,
+      filename,
+      originalName,
+      bytes: req.file.size,
+      mimeType: "application/pdf",
+    });
+  } catch (err) {
+    console.error("[media:document]", err.message);
+    res.status(500).json({ error: "PDF upload failed." });
+  }
+});
+
 // POST /api/media/viewed/:filename — delete view-once after viewing
 router.post("/viewed/:filename", async (req, res) => {
   const { filename } = req.params;
@@ -122,7 +160,7 @@ router.post("/viewed/:filename", async (req, res) => {
     // message that actually references this filename and confirm the
     // requester belongs to that chat before deleting anything.
     const msg = await pool.query(
-      `SELECT chat_id FROM messages
+      `SELECT id, chat_id, sender_id FROM messages
        WHERE text LIKE '[view-once]%' AND text LIKE '%|' || $1
        LIMIT 1`,
       [filename]
@@ -137,10 +175,33 @@ router.post("/viewed/:filename", async (req, res) => {
     if (!membership.rows[0]) {
       return res.status(403).json({ error: "Not authorized to delete this file." });
     }
+    if (msg.rows[0].sender_id === req.user.userId) {
+      return res.status(403).json({ error: "The sender cannot consume their own view-once message." });
+    }
 
-    await deleteFile(filename, "");
-    console.log(`[media] View-once deleted: ${filename} by ${req.user.username}`);
-    res.json({ success: true });
+    await pool.query(
+      `INSERT INTO view_once_receipts (message_id,user_id,viewed_at)
+       VALUES ($1,$2,NOW())
+       ON CONFLICT (message_id,user_id) DO NOTHING`,
+      [msg.rows[0].id, req.user.userId]
+    );
+
+    const remaining = await pool.query(
+      `SELECT COUNT(*)::int AS count
+       FROM chat_members cm
+       WHERE cm.chat_id=$1 AND cm.user_id!=$2
+         AND NOT EXISTS (
+           SELECT 1 FROM view_once_receipts vor
+           WHERE vor.message_id=$3 AND vor.user_id=cm.user_id
+         )`,
+      [msg.rows[0].chat_id, msg.rows[0].sender_id, msg.rows[0].id]
+    );
+    if (remaining.rows[0].count === 0) {
+      await pool.query("UPDATE messages SET viewed_at=COALESCE(viewed_at,NOW()) WHERE id=$1", [msg.rows[0].id]);
+      await deleteFile(filename, "");
+      console.log(`[media] View-once deleted after all recipients viewed: ${filename}`);
+    }
+    res.json({ success: true, consumed: true });
   } catch (err) {
     console.error("[media] Delete error:", err.message);
     res.status(500).json({ error: "Failed to delete." });

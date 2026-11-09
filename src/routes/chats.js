@@ -2,6 +2,7 @@ const express = require("express");
 const { requireAuth } = require("../middleware/auth");
 const { getUserChats, getOrCreateDirectChat } = require("../db/queries");
 const pool = require("../db/pool");
+const { deriveAndNotifyStatuses, sendMessageInChat } = require("../socket/messageHandlers");
 const router = express.Router();
 
 // All routes require a valid JWT
@@ -114,7 +115,11 @@ router.get("/:chatId/messages", async (req, res) => {
       `SELECT m.id, m.chat_id, m.sender_id, m.client_message_id, m.text,
               m.status, m.reply_to_id, m.reply_to_text, m.reply_to_sender,
               m.viewed_at, m.created_at, m.provenance_kind, m.forward_depth,
-              m.safety_status, u.username AS sender_name
+              m.safety_status, u.username AS sender_name,
+              EXISTS (
+                SELECT 1 FROM view_once_receipts vor
+                WHERE vor.message_id=m.id AND vor.user_id=$2
+              ) AS view_once_viewed
        FROM messages m
        JOIN users u ON u.id = m.sender_id
        WHERE m.chat_id = $1
@@ -133,6 +138,23 @@ router.get("/:chatId/messages", async (req, res) => {
   }
 });
 
+// Plain-text message endpoint used by notification quick reply when a socket
+// is unavailable or the app is being resumed from the notification shade.
+router.post("/:chatId/messages", async (req, res) => {
+  try {
+    const message = await sendMessageInChat(req.app.get("io"), {
+      chatId: req.params.chatId,
+      senderId: req.user.userId,
+      text: req.body.text,
+      clientMessageId: req.body.clientMessageId,
+    });
+    res.status(201).json({ message });
+  } catch (err) {
+    console.error("[messages:quick-reply]", err.message);
+    res.status(err.status || 500).json({ error: err.status ? err.message : "Message could not be sent." });
+  }
+});
+
 // ─── POST /api/chats/:chatId/read ─────────────────────────────────────────────
 // Mark all unread messages in a chat as read (called when user opens a chat)
 router.post("/:chatId/read", async (req, res) => {
@@ -148,30 +170,18 @@ router.post("/:chatId/read", async (req, res) => {
       return res.status(403).json({ error: "Not a member of this chat." });
     }
 
-    await pool.query(
+    const changed = await pool.query(
       `INSERT INTO message_receipts (message_id, user_id, status)
-       SELECT id, $2, 'read' FROM messages
-       WHERE chat_id=$1 AND sender_id!=$2
+       SELECT id, $2::varchar, 'read' FROM messages
+       WHERE chat_id=$1 AND sender_id!=$2::varchar
        ON CONFLICT (message_id, user_id) DO UPDATE
-       SET status='read'`,
+       SET status='read',
+           delivered_at=COALESCE(message_receipts.delivered_at, NOW()),
+           read_at=COALESCE(message_receipts.read_at, NOW())
+       RETURNING message_id`,
       [req.params.chatId, req.user.userId]
     );
-    await pool.query(
-      `UPDATE messages m SET status=summary.status
-       FROM (
-         SELECT r.message_id,
-           CASE
-             WHEN COUNT(*) FILTER (WHERE r.status='read')=COUNT(*) THEN 'read'
-             WHEN COUNT(*) FILTER (WHERE r.status IN ('delivered','read'))=COUNT(*) THEN 'delivered'
-             ELSE 'sent'
-           END AS status
-         FROM message_receipts r
-         JOIN messages target ON target.id=r.message_id AND target.chat_id=$1
-         GROUP BY r.message_id
-       ) summary
-       WHERE m.id=summary.message_id`,
-      [req.params.chatId]
-    );
+    await deriveAndNotifyStatuses(req.app.get("io"), changed.rows.map((row) => row.message_id));
     res.json({ success: true });
   } catch (err) {
     console.error("[chats:read] Error:", err.message);
